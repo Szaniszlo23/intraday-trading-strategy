@@ -42,7 +42,7 @@ class SignalGenerator:
         pd.Series[float] with values in {-1, 0, +1}, indexed like day_df.
         """
         cfg = self.config
-        open_price = day_df["close"].iloc[0]
+        open_price = day_df["open"].iloc[0]
         close_prices = day_df["close"]
         vwap = day_df["vwap"]
         sigma = day_df["sigma_open"]

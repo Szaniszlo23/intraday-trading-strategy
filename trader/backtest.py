@@ -62,6 +62,7 @@ class Backtester:
             index=all_days, columns=["ret", "AUM", "ret_spy"], dtype=float
         )
         result["AUM"] = cfg.aum_0
+        prev_aum = cfg.aum_0
 
         for d in range(1, len(all_days)):
             current_day = all_days[d]
@@ -79,7 +80,7 @@ class Backtester:
             prev_close = prev_df["close"].iloc[-1]
             open_price = cur_df["open"].iloc[0] if "open" in cur_df.columns else cur_df["close"].iloc[0]
             daily_vol = cur_df["spy_dvol"].iloc[0]
-            prev_aum = result.loc[prev_day, "AUM"]
+            
 
             exposure = self._signal_gen.generate(cur_df, prev_close)
             shares = self._sizer.shares(prev_aum, open_price, daily_vol)
@@ -87,6 +88,8 @@ class Backtester:
 
             result.loc[current_day, "AUM"] = prev_aum + net_pnl
             result.loc[current_day, "ret"] = net_pnl / prev_aum
+            
+            prev_aum = prev_aum + net_pnl
 
             today_dt = pd.Timestamp(current_day)
             if today_dt in df_daily.index:
