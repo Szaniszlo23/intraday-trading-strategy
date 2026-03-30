@@ -42,3 +42,7 @@ Thumbs.db
 # Outputs (generated, not source)
 analysis/plots/*.png
 analysis/results/*.csv
+
+
+#Claude
+.claude
