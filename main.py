@@ -158,7 +158,7 @@ def main() -> None:
         )
         sys.exit(1)
 
-    app_cfg = AppConfig.from_yaml(cfg_path)
+    app_cfg = AppConfig.load(cfg_path)
     live = LiveTrader(app_cfg)
 
     def _shutdown(sig, frame):

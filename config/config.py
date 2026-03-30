@@ -1,24 +1,81 @@
 """
 Configuration for the intraday momentum strategy.
 
-All strategy parameters, execution settings, and API credentials
-are centralised here so they can be loaded from config.yaml without
-scattering magic numbers across the codebase.
+API credentials are loaded exclusively from environment variables so
+they are never stored in files that could accidentally be committed.
+
+Priority order for credentials:
+  1. Actual environment variables (e.g. set in your shell, Docker, or Cloud Run)
+  2. A .env file in the project root (for local development — gitignored)
+
+All other strategy parameters (band_mult, trade_freq, etc.) can still
+be tuned via config/config.yaml, which contains NO secrets.
+
+Usage
+-----
+Local development:
+    Copy .env.example → .env and fill in your keys.
+    The app loads .env automatically via python-dotenv.
+
+Docker / Cloud Run:
+    Pass ALPACA_API_KEY and ALPACA_SECRET_KEY as environment variables.
+    No .env file needed.
 """
 
 from __future__ import annotations
 
-import yaml
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
+
+import yaml
+from dotenv import load_dotenv
+
+# Load .env from project root if it exists (silently ignored if absent)
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 
 @dataclass
 class AlpacaConfig:
-    api_key: str = ""
-    secret_key: str = ""
+    api_key: str = field(default_factory=lambda: os.environ.get("ALPACA_API_KEY", ""))
+    secret_key: str = field(default_factory=lambda: os.environ.get("ALPACA_SECRET_KEY", ""))
     paper: bool = True
-    base_url: str = "https://paper-api.alpaca.markets"
+    base_url: str = "https://paper-api.alpaca.markets/v2"
+
+    @classmethod
+    def from_env(cls) -> "AlpacaConfig":
+        """
+        Build AlpacaConfig from environment variables.
+
+        Required env vars:
+            ALPACA_API_KEY      — your Alpaca API key
+            ALPACA_SECRET_KEY   — your Alpaca secret key
+
+        Optional env vars:
+            ALPACA_PAPER        — "true" (default) or "false"
+            ALPACA_BASE_URL     — override the API base URL
+        """
+        api_key = os.environ.get("ALPACA_API_KEY", "")
+        secret_key = os.environ.get("ALPACA_SECRET_KEY", "")
+
+        if not api_key or not secret_key:
+            raise EnvironmentError(
+                "Missing Alpaca credentials. "
+                "Set ALPACA_API_KEY and ALPACA_SECRET_KEY as environment variables, "
+                "or add them to your .env file (see .env.example)."
+            )
+
+        paper_raw = os.environ.get("ALPACA_PAPER", "true").lower()
+        paper = paper_raw not in ("false", "0", "no")
+
+        default_url = (
+            "https://paper-api.alpaca.markets"
+            if paper
+            else "https://api.alpaca.markets"
+        )
+        base_url = os.environ.get("ALPACA_BASE_URL", default_url)
+
+        return cls(api_key=api_key, secret_key=secret_key, paper=paper, base_url=base_url)
 
 
 @dataclass
@@ -54,20 +111,35 @@ class AppConfig:
     strategy: StrategyConfig = field(default_factory=StrategyConfig)
 
     @classmethod
-    def from_yaml(cls, path: str | Path = "config/config.yaml") -> "AppConfig":
-        """Load configuration from a YAML file."""
-        with open(path) as f:
-            raw = yaml.safe_load(f)
+    def load(cls, yaml_path: str | Path = "config/config.yaml") -> "AppConfig":
+        """
+        Load a full AppConfig.
 
-        alpaca_raw = raw.get("alpaca", {})
-        strategy_raw = raw.get("strategy", {})
+        - Alpaca credentials come from environment variables / .env
+        - Strategy parameters come from config/config.yaml
+        """
+        strategy = StrategyConfig()
+
+        path = Path(yaml_path)
+        if path.exists():
+            with open(path) as f:
+                raw = yaml.safe_load(f) or {}
+            strategy_raw = raw.get("strategy", {})
+            strategy = StrategyConfig(**strategy_raw)
 
         return cls(
-            alpaca=AlpacaConfig(**alpaca_raw),
-            strategy=StrategyConfig(**strategy_raw),
+            alpaca=AlpacaConfig.from_env(),
+            strategy=strategy,
         )
 
     @classmethod
     def default(cls) -> "AppConfig":
-        """Return a default configuration (useful for testing without config.yaml)."""
-        return cls()
+        """
+        Return a config with defaults — credentials from env, default strategy params.
+        Useful for tests that mock the Alpaca client.
+        """
+        try:
+            alpaca = AlpacaConfig.from_env()
+        except EnvironmentError:
+            alpaca = AlpacaConfig()  # empty keys — safe for unit tests
+        return cls(alpaca=alpaca, strategy=StrategyConfig())

@@ -171,7 +171,7 @@ def main() -> None:
     PLOT_DIR.mkdir(parents=True, exist_ok=True)
 
     cfg_path = Path(args.config)
-    app_cfg = AppConfig.from_yaml(cfg_path) if cfg_path.exists() else AppConfig.default()
+    app_cfg = AppConfig.load(cfg_path)
 
     raw = load_data(args, app_cfg)
     print("Preprocessing features...")

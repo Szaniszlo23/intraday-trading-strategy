@@ -1,5 +1,6 @@
 # Secrets — never commit real keys
-config/config.yaml
+.env
+# config/config.yaml is safe to commit (no secrets — keys live in .env)
 
 # Raw data — too large for git
 data/raw/*.csv
