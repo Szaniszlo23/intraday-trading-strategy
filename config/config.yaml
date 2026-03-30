@@ -1,0 +1,32 @@
+# ---------------------------------------------------------------
+# Intraday Momentum Strategy — Parameters
+#
+# API credentials are NOT stored here.
+# Set ALPACA_API_KEY and ALPACA_SECRET_KEY in your .env file
+# (see .env.example) or as host environment variables.
+# ---------------------------------------------------------------
+
+strategy:
+  # Signal construction
+  band_mult: 1.0          # Noise-band multiplier
+  trade_freq: 30          # Minutes between signal evaluations
+  rsi_period: 14          # RSI look-back window (bars)
+
+  # RSI filter
+  rsi_filter: true        # Enable RSI confirmation filter
+  rsi_long: 60            # Go long only when RSI > this
+  rsi_short: 40           # Go short only when RSI < this
+
+  # Position sizing
+  sizing_type: "vol_target"  # "vol_target" | "full_notional"
+  target_vol: 0.02        # Daily target volatility
+  max_leverage: 4.0       # Maximum leverage cap
+
+  # Execution & costs
+  aum_0: 100000.0
+  commission: 0.0035
+  min_comm: 0.35
+
+  # Universe
+  symbol: "SPY"
+  vol_window: 14
