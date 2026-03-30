@@ -7,7 +7,6 @@ and returns the enriched intraday frame + a daily summary frame.
 
 from __future__ import annotations
 
-import numpy as np
 import pandas as pd
 
 from config.config import StrategyConfig
@@ -36,7 +35,7 @@ class Preprocessor:
         Returns
         -------
         df_intraday : enriched with vwap, move_open, spy_dvol, sigma_open,
-                      min_from_open, minute_of_day, rsi
+                      min_from_open, minute_of_day
         df_daily    : daily OHLCV + return, indexed by date (DatetimeIndex)
         """
         df = df.copy()
@@ -46,7 +45,6 @@ class Preprocessor:
         df["move_open"] = Indicators.move_open(df)
         df["spy_dvol"] = Indicators.daily_vol(df, window=self.config.vol_window)
         df["sigma_open"] = self._sigma_open(df)
-        df["rsi"] = Indicators.rsi(df["close"], period=self.config.rsi_period)
 
         df_daily = self._build_daily(df)
         return df, df_daily

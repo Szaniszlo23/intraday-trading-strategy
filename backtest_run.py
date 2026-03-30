@@ -9,13 +9,20 @@ Usage
     # Run with Alpaca API data:
     python backtest_run.py --start 2024-01-01 --end 2026-01-01
 
-    # Include grid-search parameter optimisation:
+    # Include grid-search parameter optimisation (baseline only):
     python backtest_run.py --csv data/raw/spy_intraday.csv --optimize
 
 Output
 ------
   Plots saved to analysis/plots/
   Performance tables printed to stdout
+
+Strategies compared
+-------------------
+  Baseline  — noise-band + VWAP, 30-min clock, 14-day sigma
+  Enhanced  — same boundary, 1-min every-bar monitoring with dual-bar
+              confirmation, VWAP trailing stop, 90-day sigma, Layer 2
+              sizing multiplier (vol-regime × flow composite)
 """
 
 from __future__ import annotations
@@ -35,7 +42,7 @@ from analysis.metrics import PerformanceMetrics
 from config.config import AppConfig, StrategyConfig
 from data.fetch import AlpacaFetcher
 from data.preprocess import Preprocessor
-from trader.backtest import Backtester
+from trader.backtest import Backtester, EnhancedBacktester
 
 PLOT_DIR = Path("analysis/plots")
 
@@ -47,33 +54,38 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--end", type=str, default="2026-01-01")
     parser.add_argument("--config", type=str, default="config/config.yaml")
     parser.add_argument("--optimize", action="store_true",
-                        help="Run grid-search parameter optimisation")
+                        help="Run grid-search parameter optimisation (baseline)")
     return parser.parse_args()
 
 
 def load_data(args: argparse.Namespace, app_cfg: AppConfig) -> pd.DataFrame:
+    """Load raw 1-min bars (including extended hours for flow composite)."""
     if args.csv:
         print(f"Loading data from CSV: {args.csv}")
         return AlpacaFetcher.from_csv(args.csv)
 
     print(f"Fetching data from Alpaca ({args.start} – {args.end}) ...")
     fetcher = AlpacaFetcher(app_cfg.alpaca)
-    df = fetcher.get_historical_bars(app_cfg.strategy.symbol, args.start, args.end)
+    df = fetcher.get_historical_bars(
+        app_cfg.strategy.symbol, args.start, args.end, include_extended=True
+    )
     if df.empty:
         print("ERROR: No data returned. Check your Alpaca credentials and date range.")
         sys.exit(1)
     return df
 
 
-def plot_comparison(base_result, rsi_result, aum_0: float, save_path: Path) -> None:
+def plot_comparison(
+    base_result, enh_result, aum_0: float, save_path: Path
+) -> None:
     PLOT_DIR.mkdir(parents=True, exist_ok=True)
     fig, ax = plt.subplots(figsize=(13, 7))
 
     spy_aum = aum_0 * (1 + base_result.daily["ret_spy"]).cumprod(skipna=True)
     ax.plot(base_result.daily.index, base_result.aum,
-            label="Base Strategy", color="#2C3E50", lw=2)
-    ax.plot(rsi_result.daily.index, rsi_result.aum,
-            label="RSI Filter Strategy", color="#3498DB", lw=2)
+            label="Baseline Strategy", color="#2C3E50", lw=2)
+    ax.plot(enh_result.daily.index, enh_result.aum,
+            label="Enhanced Strategy", color="#27AE60", lw=2)
     ax.plot(base_result.daily.index, spy_aum,
             label="SPY Buy & Hold", color="#E74C3C", lw=2, ls="--")
 
@@ -90,7 +102,7 @@ def plot_comparison(base_result, rsi_result, aum_0: float, save_path: Path) -> N
     ax.grid(True, ls="--", alpha=0.3)
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
-    ax.set_title("Intraday Momentum — Base vs RSI Filter", fontweight="bold", fontsize=13)
+    ax.set_title("Intraday Momentum — Baseline vs Enhanced", fontweight="bold", fontsize=13)
     ax.legend()
     plt.tight_layout()
     plt.savefig(save_path, dpi=150)
@@ -127,9 +139,9 @@ def plot_train_test(train_res, test_res, best_params: dict, aum_0: float, save_p
 
 def run_grid_search(df, df_daily, base_cfg: StrategyConfig, train_ratio: float = 0.70):
     param_grid = {
-        "band_mult": [0.5, 1.0, 1.5],
-        "trade_freq": [15, 30, 60],
-        "target_vol": [0.01, 0.02, 0.03],
+        "band_mult":    [0.5, 1.0, 1.5],
+        "trade_freq":   [15, 30, 60],
+        "target_vol":   [0.01, 0.02, 0.03],
         "max_leverage": [2, 4, 6],
     }
     keys = list(param_grid.keys())
@@ -156,7 +168,7 @@ def run_grid_search(df, df_daily, base_cfg: StrategyConfig, train_ratio: float =
     print(f"\nBest train params (Sharpe={best_sharpe:.3f}): {best_params}")
     cfg_best = StrategyConfig(**{**base_cfg.__dict__, **best_params})
     train_result = Backtester(cfg_best).run(df_train, dd_train)
-    test_result = Backtester(cfg_best).run(df_test, dd_test)
+    test_result  = Backtester(cfg_best).run(df_test,  dd_test)
 
     print("\n[TRAIN]")
     print(train_result.metrics)
@@ -173,29 +185,39 @@ def main() -> None:
     cfg_path = Path(args.config)
     app_cfg = AppConfig.load(cfg_path)
 
+    # raw includes extended-hours bars (pre-market) for the flow composite
     raw = load_data(args, app_cfg)
-    print("Preprocessing features...")
-    df, df_daily = Preprocessor(app_cfg.strategy).transform(raw)
 
-    # Base strategy (no RSI filter)
-    base_cfg = StrategyConfig(**{**app_cfg.strategy.__dict__, "rsi_filter": False})
-    print("\nRunning base strategy...")
-    base_result = Backtester(base_cfg).run(df, df_daily)
-    print("\n[BASE STRATEGY]")
+    # Session-only slice for preprocessing (indicators expect 09:30-16:00)
+    raw_session = raw.between_time("09:30", "16:00")
+
+    # ---- Baseline (14-day sigma, 30-min clock) ----
+    print("Preprocessing baseline features (vol_window=14)...")
+    base_strategy_cfg = StrategyConfig(**{**app_cfg.strategy.__dict__, "vol_window": 14})
+    df_base, df_daily_base = Preprocessor(base_strategy_cfg).transform(raw_session)
+
+    print("\nRunning Baseline strategy...")
+    base_result = Backtester(base_strategy_cfg).run(df_base, df_daily_base)
+    print("\n[BASELINE STRATEGY]")
     print(base_result.metrics)
 
-    # RSI-filtered strategy
-    rsi_cfg = StrategyConfig(**{**app_cfg.strategy.__dict__, "rsi_filter": True})
-    print("\nRunning RSI-filtered strategy...")
-    rsi_result = Backtester(rsi_cfg).run(df, df_daily)
-    print("\n[RSI FILTER STRATEGY]")
-    print(rsi_result.metrics)
+    # ---- Enhanced (90-day sigma, 1-min dual-bar, Layer 2 sizing) ----
+    print("\nPreprocessing enhanced features (vol_window=90)...")
+    enh_strategy_cfg = StrategyConfig(**{**app_cfg.strategy.__dict__, "vol_window": 90})
+    df_enh, df_daily_enh = Preprocessor(enh_strategy_cfg).transform(raw_session)
 
-    plot_comparison(base_result, rsi_result, app_cfg.strategy.aum_0,
+    print("\nRunning Enhanced strategy...")
+    enh_result = EnhancedBacktester(enh_strategy_cfg).run(df_enh, df_daily_enh, raw)
+    print("\n[ENHANCED STRATEGY]")
+    print(enh_result.metrics)
+
+    plot_comparison(base_result, enh_result, app_cfg.strategy.aum_0,
                     PLOT_DIR / "strategy_comparison.png")
 
     if args.optimize:
-        best_params, train_res, test_res = run_grid_search(df, df_daily, app_cfg.strategy)
+        best_params, train_res, test_res = run_grid_search(
+            df_base, df_daily_base, base_strategy_cfg
+        )
         plot_train_test(train_res, test_res, best_params, app_cfg.strategy.aum_0,
                         PLOT_DIR / "train_test_split.png")
 

@@ -4,16 +4,24 @@ Technical indicators used by the intraday momentum strategy.
 All methods are static — call them directly on pandas Series/DataFrames
 without instantiating an object.
 
-Indicators
-----------
+Indicators (Baseline)
+---------------------
 - VWAP         : cumulative intraday volume-weighted average price
 - move_open    : absolute % move from the day's opening price
-- sigma_open   : per-minute rolling mean of move_open (14-day), lagged 1 day
-- spy_dvol     : 14-day rolling daily return volatility
-- rsi          : Wilder (EMA-smoothed) RSI on 1-minute closes
+- sigma_open   : per-minute rolling mean of move_open (configurable window), lagged 1 day
+- spy_dvol     : rolling daily return volatility
+
+Enhanced Strategy Helpers
+--------------------------
+- vol_regime_factor   : 5-day realized vol → sizing multiplier [0.70, 1.30]
+- premarket_return    : SPY return from 04:00 to 09:29
+- order_imbalance     : tick-rule imbalance from first 30 session bars [-1, 1]
+- flow_composite_mult : combine premarket trend + imbalance → multiplier [0.80, 1.20]
 """
 
 from __future__ import annotations
+
+import math
 
 import numpy as np
 import pandas as pd
@@ -86,7 +94,8 @@ class Indicators:
     @staticmethod
     def daily_vol(df: pd.DataFrame, window: int = 14) -> pd.Series:
         """
-        14-day rolling std of daily returns, mapped back to every intraday bar.
+        Rolling std of daily returns over `window` days, mapped back to every
+        intraday bar.
 
         Returns a Series aligned to df.index (same value for all bars in a day).
         """
@@ -98,25 +107,104 @@ class Indicators:
         return day_dt.map(rolling_vol)
 
     # ------------------------------------------------------------------
-    # RSI  (Wilder / EMA-smoothed)
+    # Enhanced strategy helpers
     # ------------------------------------------------------------------
 
     @staticmethod
-    def rsi(close: pd.Series, period: int = 14) -> pd.Series:
+    def vol_regime_factor(daily_returns: pd.Series) -> float:
         """
-        Wilder RSI on a price series.
+        Compute the vol-regime sizing multiplier from the last 5 daily returns.
 
-        Uses EMA smoothing with alpha = 1/period, which is equivalent
-        to Wilder's original smoothing method.
+        Maps 5-day realized annualized vol to a multiplier:
+          < 10%  → 0.70  (choppy/low-vol — reduce size)
+          > 25%  → 1.30  (trending/high-vol — increase size)
+          else   → linear interpolation between 0.70 and 1.30
 
-        Returns values in [0, 100].
+        Parameters
+        ----------
+        daily_returns : recent daily simple returns (uses last 5)
+
+        Returns
+        -------
+        float in [0.70, 1.30] — returns 1.0 if fewer than 5 observations.
         """
-        delta = close.diff()
-        gain = delta.clip(lower=0)
-        loss = (-delta).clip(lower=0)
+        recent = daily_returns.dropna().tail(5)
+        if len(recent) < 5:
+            return 1.0
+        vol_5d = float(recent.std() * math.sqrt(252))
+        if vol_5d < 0.10:
+            return 0.70
+        if vol_5d > 0.25:
+            return 1.30
+        return 0.70 + (vol_5d - 0.10) / (0.25 - 0.10) * (1.30 - 0.70)
 
-        avg_gain = gain.ewm(alpha=1 / period, adjust=False).mean()
-        avg_loss = loss.ewm(alpha=1 / period, adjust=False).mean()
+    @staticmethod
+    def premarket_return(pm_bars: pd.DataFrame) -> float:
+        """
+        SPY pre-market return from 04:00 to 09:29.
 
-        rs = avg_gain / avg_loss.replace(0, np.nan)
-        return 100 - (100 / (1 + rs))
+        Parameters
+        ----------
+        pm_bars : DataFrame of pre-market 1-min bars (04:00–09:29),
+                  must have 'open' and 'close' columns.
+
+        Returns
+        -------
+        float — simple return; 0.0 if bars are empty.
+        """
+        if pm_bars.empty:
+            return 0.0
+        return float(pm_bars["close"].iloc[-1] / pm_bars["open"].iloc[0] - 1)
+
+    @staticmethod
+    def order_imbalance(first_30: pd.DataFrame) -> float:
+        """
+        Tick-rule order imbalance from the first 30 regular session bars.
+
+        Up bars (close > open) are attributed to buyers; down bars to sellers.
+        Returns neutral (0.0) on news-driven days where the session range
+        exceeds 0.5% in the first 30 minutes — the signal is unreliable there.
+
+        Parameters
+        ----------
+        first_30 : first 30 bars of the regular session (09:30 onward),
+                   must have 'open', 'high', 'low', 'close' columns.
+
+        Returns
+        -------
+        float in [-1, 1] — positive = buyer pressure, negative = seller pressure.
+        """
+        if first_30.empty:
+            return 0.0
+        session_range = (
+            (first_30["high"].max() - first_30["low"].min())
+            / first_30["open"].iloc[0]
+        )
+        if session_range > 0.005:
+            return 0.0  # news-driven day — neutral
+        n = len(first_30)
+        up_bars = int((first_30["close"] > first_30["open"]).sum())
+        down_bars = int((first_30["close"] < first_30["open"]).sum())
+        return (up_bars - down_bars) / n
+
+    @staticmethod
+    def flow_composite_mult(pm_ret: float, imbalance: float) -> float:
+        """
+        Combine pre-market trend and order imbalance into a sizing multiplier.
+
+        Weights: 0.4 × pre-market trend signal + 0.6 × order imbalance.
+        The composite (range ~[-1, 1]) is mapped linearly to [0.80, 1.20].
+
+        Parameters
+        ----------
+        pm_ret    : pre-market simple return (from premarket_return())
+        imbalance : tick-rule imbalance (from order_imbalance())
+
+        Returns
+        -------
+        float in [0.80, 1.20]
+        """
+        pm_signal = math.tanh(pm_ret * 100)          # squash to [-1, 1]
+        composite = 0.4 * pm_signal + 0.6 * imbalance
+        # Map [-1, 1] → [0.80, 1.20]
+        return 0.80 + (composite + 1.0) / 2.0 * 0.40

@@ -82,13 +82,7 @@ class AlpacaConfig:
 class StrategyConfig:
     # --- Signal construction ---
     band_mult: float = 1.0       # Noise-band multiplier (σ scaling)
-    trade_freq: int = 30         # Minutes between signal evaluations
-    rsi_period: int = 14         # RSI look-back window (bars)
-
-    # --- RSI filter ---
-    rsi_filter: bool = True      # Enable RSI confirmation filter
-    rsi_long: int = 60           # Go long only when RSI > rsi_long
-    rsi_short: int = 40          # Go short only when RSI < rsi_short
+    trade_freq: int = 30         # Minutes between signal evaluations (baseline only)
 
     # --- Position sizing ---
     sizing_type: str = "vol_target"  # "vol_target" | "full_notional"
