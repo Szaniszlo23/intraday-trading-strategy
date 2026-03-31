@@ -43,6 +43,7 @@ from config.config import AppConfig, StrategyConfig
 from data.fetch import AlpacaFetcher
 from data.preprocess import Preprocessor
 from trader.backtest import Backtester, EnhancedBacktester
+from trader.signals import EnhancedSignalGenerator
 
 PLOT_DIR = Path("analysis/plots")
 
@@ -56,7 +57,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--optimize", action="store_true",
                         help="Run grid-search parameter optimisation (baseline)")
     parser.add_argument("--save", type=str, help="Save fetched data to CSV path")
-    
+    parser.add_argument("--variants", action="store_true",
+                        help="Isolate each enhancement one at a time (6 variants)")
+    parser.add_argument("--yearly", action="store_true",
+                        help="Print year-by-year performance breakdown")
+
     return parser.parse_args()
 
 
@@ -144,6 +149,137 @@ def plot_train_test(train_res, test_res, best_params: dict, aum_0: float, save_p
     plt.show()
 
 
+def print_yearly_breakdown(name: str, result) -> None:
+    """Print a year-by-year performance table for a BacktestResult."""
+    yearly = PerformanceMetrics.compute_yearly(result.returns, result.daily["ret_spy"])
+    trades_by_year = result.daily["trades"].groupby(result.daily.index.year).sum()
+    avg_dur_by_year = result.daily["avg_dur"].groupby(result.daily.index.year).mean()
+
+    header = f"\n{'─' * 84}\n  {name} — Year-by-Year Breakdown\n{'─' * 84}"
+    print(header)
+    print(f"  {'Year':<6} {'Ann Ret %':>9} {'Sharpe':>7} {'MaxDD %':>8} {'Hit %':>7} {'N Trades':>9} {'Avg Hold (min)':>14}")
+    print(f"  {'─'*6} {'─'*9} {'─'*7} {'─'*8} {'─'*7} {'─'*9} {'─'*14}")
+    for year in sorted(yearly):
+        m = yearly[year]
+        n_trades = int(trades_by_year.get(year, 0))
+        avg_dur  = avg_dur_by_year.get(year, float("nan"))
+        avg_dur_str = f"{avg_dur:>14.1f}" if not np.isnan(avg_dur) else f"{'—':>14}"
+        print(
+            f"  {year:<6} {m.annualized_return:>9.1f} {m.sharpe_ratio:>7.2f} "
+            f"{m.max_drawdown:>8.1f} {m.hit_ratio:>7.1f} {n_trades:>9} {avg_dur_str}"
+        )
+    print(f"{'─' * 84}")
+
+
+def run_variants(
+    raw: "pd.DataFrame",
+    raw_session: "pd.DataFrame",
+    app_cfg: AppConfig,
+) -> None:
+    """
+    Run 6 cumulative variants, adding one enhancement at a time:
+
+      V1  Baseline          — SignalGenerator, 14d sigma, 30-min clock
+      V2  +90d sigma        — SignalGenerator, 90d sigma, 30-min clock
+      V3  +Every bar        — EnhancedSignalGenerator, no dual-bar, no VWAP stop
+      V4  +Dual-bar confirm — EnhancedSignalGenerator, dual-bar, no VWAP stop
+      V5  +VWAP stop        — EnhancedSignalGenerator, dual-bar, VWAP stop
+      V6  Full enhanced     — above + Layer 2 sizing multiplier
+    """
+    base_cfg = app_cfg.strategy
+
+    # Pre-process once per sigma window (two passes)
+    print("\nPreprocessing 14d sigma features...")
+    cfg_14 = StrategyConfig(**{**base_cfg.__dict__, "vol_window": 14})
+    df_14, dd_14 = Preprocessor(cfg_14).transform(raw_session)
+
+    print("Preprocessing 90d sigma features...")
+    cfg_90 = StrategyConfig(**{**base_cfg.__dict__, "vol_window": 90})
+    df_90, dd_90 = Preprocessor(cfg_90).transform(raw_session)
+
+    variants = [
+        ("V1  Baseline",           lambda: Backtester(cfg_14).run(df_14, dd_14)),
+        ("V2  +90d sigma",         lambda: Backtester(cfg_90).run(df_90, dd_90)),
+        ("V3  +Every bar",         lambda: EnhancedBacktester(
+            cfg_90,
+            signal_gen=EnhancedSignalGenerator(cfg_90, use_dual_bar=False, use_vwap_stop=False),
+            use_layer2=False,
+        ).run(df_90, dd_90, raw)),
+        ("V4  +Dual-bar",          lambda: EnhancedBacktester(
+            cfg_90,
+            signal_gen=EnhancedSignalGenerator(cfg_90, use_dual_bar=True, use_vwap_stop=False),
+            use_layer2=False,
+        ).run(df_90, dd_90, raw)),
+        ("V5  +VWAP stop",         lambda: EnhancedBacktester(
+            cfg_90,
+            signal_gen=EnhancedSignalGenerator(cfg_90, use_dual_bar=True, use_vwap_stop=True),
+            use_layer2=False,
+        ).run(df_90, dd_90, raw)),
+        ("V6  Full enhanced",      lambda: EnhancedBacktester(
+            cfg_90,
+            signal_gen=EnhancedSignalGenerator(cfg_90, use_dual_bar=True, use_vwap_stop=True),
+            use_layer2=True,
+        ).run(df_90, dd_90, raw)),
+    ]
+
+    print("\n" + "═" * 104)
+    print(f"  {'VARIANT ISOLATION ANALYSIS':^102}")
+    print("═" * 104)
+    print(
+        f"  {'Variant':<22} {'Tot Ret%':>8} {'Ann Ret%':>9} {'Sharpe':>7} "
+        f"{'MaxDD%':>7} {'Hit%':>6} {'Alpha':>7} {'Beta':>6} {'Trades/day':>10} {'Avg Hold(min)':>13}"
+    )
+    print(f"  {'─'*22} {'─'*8} {'─'*9} {'─'*7} {'─'*7} {'─'*6} {'─'*7} {'─'*6} {'─'*10} {'─'*13}")
+
+    results = {}
+    for name, run_fn in variants:
+        print(f"  Running {name.strip()} ...", end="\r")
+        result = run_fn()
+        results[name] = result
+        m = result.metrics
+        n_days   = len(result.returns.dropna())
+        trades_d = result.daily["trades"].sum() / max(n_days, 1)
+        avg_hold = result.daily["avg_dur"].mean()
+        avg_hold_str = f"{avg_hold:>13.1f}" if not np.isnan(avg_hold) else f"{'—':>13}"
+        print(
+            f"  {name:<22} {m.total_return:>8.1f} {m.annualized_return:>9.1f} "
+            f"{m.sharpe_ratio:>7.2f} {m.max_drawdown:>7.1f} {m.hit_ratio:>6.1f} "
+            f"{m.alpha:>7.2f} {m.beta:>6.2f} {trades_d:>10.2f} {avg_hold_str}"
+        )
+
+    print("═" * 104)
+
+    # Plot all 6 equity curves on one chart
+    PLOT_DIR.mkdir(parents=True, exist_ok=True)
+    fig, ax = plt.subplots(figsize=(14, 7))
+    colours = ["#2C3E50", "#8E44AD", "#2980B9", "#27AE60", "#F39C12", "#E74C3C"]
+    for (name, _), colour in zip(variants, colours):
+        res = results[name]
+        ax.plot(res.daily.index, res.aum, label=name.strip(), lw=1.8, color=colour)
+
+    # SPY buy-and-hold overlay
+    v1_res = results[variants[0][0]]
+    spy_aum = base_cfg.aum_0 * (1 + v1_res.daily["ret_spy"]).cumprod(skipna=True)
+    ax.plot(v1_res.daily.index, spy_aum, label="SPY Buy & Hold",
+            color="gray", lw=1.5, ls="--")
+
+    ax.yaxis.set_major_formatter(FuncFormatter(lambda x, _: f"${x:,.0f}"))
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%b %Y"))
+    ax.xaxis.set_major_locator(mdates.MonthLocator(interval=3))
+    plt.xticks(rotation=45, ha="right")
+    ax.grid(True, ls="--", alpha=0.3)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.set_title("Enhancement Isolation — V1 (Baseline) → V6 (Full Enhanced)",
+                 fontweight="bold", fontsize=13)
+    ax.legend(fontsize=9)
+    plt.tight_layout()
+    save_path = PLOT_DIR / "variant_isolation.png"
+    plt.savefig(save_path, dpi=150)
+    print(f"\n  Chart saved → {save_path}")
+    plt.show()
+
+
 def run_grid_search(df, df_daily, base_cfg: StrategyConfig, train_ratio: float = 0.70):
     param_grid = {
         "band_mult":    [0.5, 1.0, 1.5],
@@ -220,6 +356,13 @@ def main() -> None:
 
     plot_comparison(base_result, enh_result, app_cfg.strategy.aum_0,
                     PLOT_DIR / "strategy_comparison.png")
+
+    if args.yearly:
+        print_yearly_breakdown("Baseline", base_result)
+        print_yearly_breakdown("Enhanced", enh_result)
+
+    if args.variants:
+        run_variants(raw, raw_session, app_cfg)
 
     if args.optimize:
         best_params, train_res, test_res = run_grid_search(

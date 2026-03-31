@@ -18,9 +18,12 @@ EnhancedSignalGenerator  — Improved strategy
 ----------------------------------------------
   Same boundary formula, but:
   - Watches every 1-minute bar (no 30-min clock)
-  - Dual-bar confirmation: bar N close beyond boundary AND bar N+1 open
-    beyond the same boundary → enter at open of bar N+1
-  - VWAP trailing stop for exits:
+  - Dual-bar confirmation (use_dual_bar=True):
+      Bar N:   close beyond boundary AND VWAP → pending
+      Bar N+1: open also beyond boundary      → confirmed, submit order
+      Bar N+2: position active (order fills at open of N+2)
+    Without dual-bar: enters immediately (same bar N close, exposure at N+1 via shift).
+  - VWAP trailing stop for exits (use_vwap_stop=True):
       long  stop = max(upper_band[i], VWAP[i])
       short stop = min(lower_band[i], VWAP[i])
   - No new entries after 15:30; force-flat handled by EOD close at 16:00
@@ -94,28 +97,53 @@ class SignalGenerator:
 
 class EnhancedSignalGenerator:
     """
-    Improved noise-band + VWAP strategy with 1-min monitoring and dual-bar
-    confirmation entry, VWAP trailing stop exits, and a 15:30 entry cutoff.
+    Improved noise-band + VWAP strategy with 1-min monitoring, optional
+    dual-bar confirmation entry, optional VWAP trailing stop exits, and a
+    15:30 entry cutoff.
 
     Uses 90-day sigma (set vol_window=90 in StrategyConfig / Preprocessor).
+
+    Parameters
+    ----------
+    use_dual_bar  : If True (default), require two-bar confirmation before
+                    entering. Bar N close crosses boundary → pending; bar N+1
+                    open also beyond boundary → submit order; position active
+                    from bar N+2 (correct for bar-stream execution).
+                    If False, enter immediately when bar N close crosses (like
+                    baseline but on every bar), with 1-bar shift for execution.
+    use_vwap_stop : If True (default), apply VWAP trailing stop exits.
+                    If False, hold until end-of-day or entry cutoff only.
     """
 
-    def __init__(self, config: StrategyConfig | None = None) -> None:
+    def __init__(
+        self,
+        config: StrategyConfig | None = None,
+        use_dual_bar: bool = True,
+        use_vwap_stop: bool = True,
+    ) -> None:
         self.config = config or StrategyConfig()
+        self.use_dual_bar = use_dual_bar
+        self.use_vwap_stop = use_vwap_stop
 
     def generate(self, day_df: pd.DataFrame, prev_close: float) -> pd.Series:
         """
         Produce a minute-level exposure series for a single trading day.
 
-        Entry logic (dual-bar confirmation)
-        ------------------------------------
+        Dual-bar confirmation entry (use_dual_bar=True)
+        ------------------------------------------------
         Bar N:   close crosses beyond boundary (and beyond VWAP)
                  → set pending signal
         Bar N+1: open is also beyond the same boundary
-                 → enter at bar N+1's open (exposure recorded for bar N+1)
+                 → confirmed; submit order at close of N+1
+        Bar N+2: position active (order fills at open of N+2)
 
-        Exit logic (VWAP trailing stop)
-        --------------------------------
+        No dual-bar (use_dual_bar=False)
+        ---------------------------------
+        Bar N:   close crosses boundary AND VWAP → exposure set at bar N+1
+                 (1-bar execution delay, same as baseline logic)
+
+        VWAP trailing stop exit (use_vwap_stop=True)
+        ---------------------------------------------
         long  stop = max(upper_band[i], VWAP[i])  — exit long when close < stop
         short stop = min(lower_band[i], VWAP[i])  — exit short when close > stop
 
@@ -147,6 +175,8 @@ class EnhancedSignalGenerator:
         current_pos = 0.0
         pending_long  = False
         pending_short = False
+        confirm_long  = False   # confirmed at N+1, enters at N+2
+        confirm_short = False
 
         for i in range(n):
             ts = day_df.index[i]
@@ -155,45 +185,87 @@ class EnhancedSignalGenerator:
             long_stop  = max(upper_band[i], vwap_arr[i])
             short_stop = min(lower_band[i], vwap_arr[i])
 
-            # Track whether we were already holding BEFORE this bar's checks
             was_long  = (current_pos ==  1.0)
             was_short = (current_pos == -1.0)
 
-            # ---- Confirm pending entry at this bar's open ----
-            entered_this_bar = False
-            if current_pos == 0.0 and not past_cutoff:
-                if pending_long and open_arr[i] > upper_band[i]:
-                    current_pos = 1.0
-                    entered_this_bar = True
-                elif pending_short and open_arr[i] < lower_band[i]:
-                    current_pos = -1.0
-                    entered_this_bar = True
-            pending_long  = False
-            pending_short = False
+            # ----------------------------------------------------------------
+            # Dual-bar path: two-step confirmation
+            # ----------------------------------------------------------------
+            if self.use_dual_bar:
+                entered_this_bar = False
 
-            # ---- VWAP trailing stop exit ----
-            stopped = False
-            if current_pos == 1.0 and close_arr[i] < long_stop:
-                current_pos = 0.0
-                stopped = True
-            elif current_pos == -1.0 and close_arr[i] > short_stop:
-                current_pos = 0.0
-                stopped = True
+                # Step 2 of 2: confirmed at previous bar — enter NOW (bar N+2)
+                if current_pos == 0.0 and not past_cutoff:
+                    if confirm_long:
+                        current_pos = 1.0
+                        entered_this_bar = True
+                    elif confirm_short:
+                        current_pos = -1.0
+                        entered_this_bar = True
+                confirm_long  = False
+                confirm_short = False
 
-            # If an EXISTING position (held from a prior bar) was stopped out,
-            # record exposure=1 so _compute_pnl captures the (negative) return
-            # of the bar that triggered the stop.  If we entered AND stopped on
-            # the same bar, exposure=0 is correct (no prior holding period).
-            if stopped and (was_long or was_short) and not entered_this_bar:
-                exposure[i] = 1.0 if was_long else -1.0
+                # VWAP trailing stop exit
+                stopped = False
+                if self.use_vwap_stop:
+                    if current_pos == 1.0 and close_arr[i] < long_stop:
+                        current_pos = 0.0
+                        stopped = True
+                    elif current_pos == -1.0 and close_arr[i] > short_stop:
+                        current_pos = 0.0
+                        stopped = True
+
+                if stopped and (was_long or was_short) and not entered_this_bar:
+                    exposure[i] = 1.0 if was_long else -1.0
+                else:
+                    exposure[i] = current_pos
+
+                # Step 1 of 2: pending → check open of next bar (confirmation)
+                # Step 1b: pending from last bar → check open of THIS bar
+                if current_pos == 0.0 and not past_cutoff:
+                    if pending_long and open_arr[i] > upper_band[i]:
+                        confirm_long = True   # will enter next bar
+                    elif pending_short and open_arr[i] < lower_band[i]:
+                        confirm_short = True  # will enter next bar
+                pending_long  = False
+                pending_short = False
+
+                # Set pending if flat and close crosses boundary
+                if current_pos == 0.0 and not past_cutoff:
+                    if close_arr[i] > upper_band[i] and close_arr[i] > vwap_arr[i]:
+                        pending_long = True
+                    elif close_arr[i] < lower_band[i] and close_arr[i] < vwap_arr[i]:
+                        pending_short = True
+
+            # ----------------------------------------------------------------
+            # No dual-bar path: immediate signal, 1-bar shift applied after loop
+            # ----------------------------------------------------------------
             else:
-                exposure[i] = current_pos
+                # VWAP trailing stop exit
+                stopped = False
+                if self.use_vwap_stop:
+                    if current_pos == 1.0 and close_arr[i] < long_stop:
+                        current_pos = 0.0
+                        stopped = True
+                    elif current_pos == -1.0 and close_arr[i] > short_stop:
+                        current_pos = 0.0
+                        stopped = True
 
-            # ---- Pending entry on next bar (only if flat and before cutoff) ----
-            if current_pos == 0.0 and not past_cutoff:
-                if close_arr[i] > upper_band[i] and close_arr[i] > vwap_arr[i]:
-                    pending_long = True
-                elif close_arr[i] < lower_band[i] and close_arr[i] < vwap_arr[i]:
-                    pending_short = True
+                if stopped and (was_long or was_short):
+                    exposure[i] = 1.0 if was_long else -1.0
+                else:
+                    # Entry signal on this bar's close
+                    if current_pos == 0.0 and not past_cutoff:
+                        if close_arr[i] > upper_band[i] and close_arr[i] > vwap_arr[i]:
+                            current_pos = 1.0
+                        elif close_arr[i] < lower_band[i] and close_arr[i] < vwap_arr[i]:
+                            current_pos = -1.0
+                    exposure[i] = current_pos
 
-        return pd.Series(exposure, index=day_df.index)
+        result = pd.Series(exposure, index=day_df.index)
+
+        # No dual-bar: apply 1-bar execution delay (same as baseline)
+        if not self.use_dual_bar:
+            result = result.shift(1).fillna(0.0)
+
+        return result

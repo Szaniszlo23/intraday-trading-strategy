@@ -17,7 +17,28 @@ from analysis.metrics import PerformanceMetrics, PerformanceResult
 from config.config import StrategyConfig
 from data.indicators import Indicators
 from trader.signals import EnhancedSignalGenerator, SignalGenerator
-from trader.sizing import EnhancedPositionSizer, PositionSizer
+from trader.sizing import EnhancedPositionSizer, PositionSizer  # noqa: F401 (PositionSizer used in EnhancedBacktester)
+
+
+def _avg_trade_duration(exp_arr: np.ndarray) -> float:
+    """
+    Return the average number of bars a trade is held, across all trades in
+    the day.  A trade starts when exposure changes from 0 → non-zero and ends
+    when it returns to 0 (or the day closes with exposure still open).
+    Returns float('nan') if no trades were taken.
+    """
+    durations = []
+    current_dur = 0
+    for val in exp_arr:
+        if val != 0.0:
+            current_dur += 1
+        else:
+            if current_dur > 0:
+                durations.append(current_dur)
+                current_dur = 0
+    if current_dur > 0:          # position still open at end of day
+        durations.append(current_dur)
+    return float(np.mean(durations)) if durations else float("nan")
 
 
 @dataclass
@@ -60,7 +81,7 @@ class Backtester:
         daily_groups = df.groupby("day")
 
         result = pd.DataFrame(
-            index=all_days, columns=["ret", "AUM", "ret_spy"], dtype=float
+            index=all_days, columns=["ret", "AUM", "ret_spy", "trades", "avg_dur"], dtype=float
         )
         result["AUM"] = cfg.aum_0
         prev_aum = cfg.aum_0
@@ -84,10 +105,12 @@ class Backtester:
 
             exposure = self._signal_gen.generate(cur_df, prev_close)
             shares = self._sizer.shares(prev_aum, open_price, daily_vol)
-            net_pnl, _ = self._compute_pnl(cur_df["close"], exposure, shares)
+            net_pnl, _, trades_count, avg_dur = self._compute_pnl(cur_df["close"], exposure, shares)
 
-            result.loc[current_day, "AUM"] = prev_aum + net_pnl
-            result.loc[current_day, "ret"] = net_pnl / prev_aum
+            result.loc[current_day, "AUM"]     = prev_aum + net_pnl
+            result.loc[current_day, "ret"]     = net_pnl / prev_aum
+            result.loc[current_day, "trades"]  = trades_count
+            result.loc[current_day, "avg_dur"] = avg_dur
             prev_aum = prev_aum + net_pnl
 
             today_dt = pd.Timestamp(current_day)
@@ -103,18 +126,19 @@ class Backtester:
         close_prices: pd.Series,
         exposure: pd.Series,
         shares: int,
-    ) -> tuple[float, float]:
+    ) -> tuple[float, float, int, float]:
         cfg = self.config
         exp_arr = exposure.values
         close_arr = close_prices.values
 
-        trades_count = np.sum(np.abs(np.diff(np.append(exp_arr, 0))))
+        trades_count = int(np.sum(np.abs(np.diff(np.append(exp_arr, 0)))))
         change_1m = np.diff(close_arr, prepend=close_arr[0])
         gross_pnl = float(np.sum(exp_arr * change_1m) * shares)
         commission_paid = float(
             trades_count * max(cfg.min_comm, cfg.commission * shares)
         )
-        return gross_pnl - commission_paid, commission_paid
+        avg_duration = _avg_trade_duration(exp_arr)
+        return gross_pnl - commission_paid, commission_paid, trades_count, avg_duration
 
     # ------------------------------------------------------------------
     # Train / test split helper
@@ -162,10 +186,18 @@ class EnhancedBacktester:
     raw_extended must include pre-market bars (include_extended=True when fetching).
     """
 
-    def __init__(self, config: StrategyConfig | None = None) -> None:
+    def __init__(
+        self,
+        config: StrategyConfig | None = None,
+        signal_gen: EnhancedSignalGenerator | None = None,
+        use_layer2: bool = True,
+    ) -> None:
         self.config = config or StrategyConfig()
-        self._signal_gen = EnhancedSignalGenerator(self.config)
-        self._sizer = EnhancedPositionSizer()
+        self.use_layer2 = use_layer2
+        self._signal_gen = signal_gen or EnhancedSignalGenerator(self.config)
+        self._sizer: EnhancedPositionSizer | PositionSizer = (
+            EnhancedPositionSizer() if use_layer2 else PositionSizer(self.config)
+        )
 
     def run(
         self,
@@ -193,7 +225,7 @@ class EnhancedBacktester:
         daily_groups = df.groupby("day")
 
         result = pd.DataFrame(
-            index=all_days, columns=["ret", "AUM", "ret_spy"], dtype=float
+            index=all_days, columns=["ret", "AUM", "ret_spy", "trades", "avg_dur"], dtype=float
         )
         result["AUM"] = cfg.aum_0
         prev_aum = cfg.aum_0
@@ -224,40 +256,45 @@ class EnhancedBacktester:
             open_price = cur_df["open"].iloc[0]
             daily_vol  = cur_df["spy_dvol"].iloc[0]
 
-            # ---- Layer 2: vol-regime factor ----
-            prior_rets = daily_ret_series[
-                daily_ret_series.index < pd.Timestamp(current_day)
-            ]
-            vol_regime = Indicators.vol_regime_factor(prior_rets)
-
-            # ---- Layer 2: flow composite ----
-            pm_ret   = 0.0
-            imbalance = 0.0
-            if current_day in raw_groups.groups:
-                raw_day = raw_groups.get_group(current_day)
-                pm_bars  = raw_day.between_time("04:00", "09:29")
-                pm_ret   = Indicators.premarket_return(pm_bars)
-            # Order imbalance uses the PREVIOUS day's first-30 session bars to
-            # avoid intra-day look-ahead (sizing is decided before the session,
-            # so we can only know what happened yesterday, not today 09:30-09:59).
-            if prev_day in raw_groups.groups:
-                raw_prev = raw_groups.get_group(prev_day)
-                first_30_prev = raw_prev.between_time("09:30", "09:59").iloc[:30]
-                imbalance = Indicators.order_imbalance(first_30_prev)
-            flow_mult = Indicators.flow_composite_mult(pm_ret, imbalance)
-
-            # ---- Sizing ----
-            shares = self._sizer.shares(
-                prev_aum, open_price, daily_vol, vol_regime, flow_mult
-            )
-
             # ---- Signals ----
             exposure = self._signal_gen.generate(cur_df, prev_close)
 
+            # ---- Sizing ----
+            if self.use_layer2:
+                # Layer 2: vol-regime factor
+                prior_rets = daily_ret_series[
+                    daily_ret_series.index < pd.Timestamp(current_day)
+                ]
+                vol_regime = Indicators.vol_regime_factor(prior_rets)
+
+                # Layer 2: flow composite
+                pm_ret    = 0.0
+                imbalance = 0.0
+                if current_day in raw_groups.groups:
+                    raw_day = raw_groups.get_group(current_day)
+                    pm_bars = raw_day.between_time("04:00", "09:29")
+                    pm_ret  = Indicators.premarket_return(pm_bars)
+                # Order imbalance uses the PREVIOUS day's first-30 session bars to
+                # avoid intra-day look-ahead (sizing is decided before the session,
+                # so we can only know what happened yesterday, not today 09:30-09:59).
+                if prev_day in raw_groups.groups:
+                    raw_prev      = raw_groups.get_group(prev_day)
+                    first_30_prev = raw_prev.between_time("09:30", "09:59").iloc[:30]
+                    imbalance     = Indicators.order_imbalance(first_30_prev)
+                flow_mult = Indicators.flow_composite_mult(pm_ret, imbalance)
+
+                shares = self._sizer.shares(
+                    prev_aum, open_price, daily_vol, vol_regime, flow_mult
+                )
+            else:
+                shares = self._sizer.shares(prev_aum, open_price, daily_vol)
+
             # ---- P&L ----
-            net_pnl, _ = self._compute_pnl(cur_df["close"], exposure, shares)
-            result.loc[current_day, "AUM"] = prev_aum + net_pnl
-            result.loc[current_day, "ret"] = net_pnl / prev_aum
+            net_pnl, _, trades_count, avg_dur = self._compute_pnl(cur_df["close"], exposure, shares)
+            result.loc[current_day, "AUM"]     = prev_aum + net_pnl
+            result.loc[current_day, "ret"]     = net_pnl / prev_aum
+            result.loc[current_day, "trades"]  = trades_count
+            result.loc[current_day, "avg_dur"] = avg_dur
             prev_aum = prev_aum + net_pnl
 
             today_dt = pd.Timestamp(current_day)
@@ -273,15 +310,16 @@ class EnhancedBacktester:
         close_prices: pd.Series,
         exposure: pd.Series,
         shares: int,
-    ) -> tuple[float, float]:
+    ) -> tuple[float, float, int, float]:
         cfg = self.config
         exp_arr   = exposure.values
         close_arr = close_prices.values
 
-        trades_count   = np.sum(np.abs(np.diff(np.append(exp_arr, 0))))
-        change_1m      = np.diff(close_arr, prepend=close_arr[0])
-        gross_pnl      = float(np.sum(exp_arr * change_1m) * shares)
+        trades_count    = int(np.sum(np.abs(np.diff(np.append(exp_arr, 0)))))
+        change_1m       = np.diff(close_arr, prepend=close_arr[0])
+        gross_pnl       = float(np.sum(exp_arr * change_1m) * shares)
         commission_paid = float(
             trades_count * max(cfg.min_comm, cfg.commission * shares)
         )
-        return gross_pnl - commission_paid, commission_paid
+        avg_duration = _avg_trade_duration(exp_arr)
+        return gross_pnl - commission_paid, commission_paid, trades_count, avg_duration

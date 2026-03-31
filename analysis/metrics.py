@@ -110,6 +110,32 @@ class PerformanceMetrics:
         )
 
     @staticmethod
+    def compute_yearly(
+        strategy_returns: pd.Series,
+        benchmark_returns: pd.Series | None = None,
+    ) -> dict[int, PerformanceResult]:
+        """
+        Compute performance metrics broken down by calendar year.
+
+        Parameters
+        ----------
+        strategy_returns  : daily net returns with a DatetimeIndex
+        benchmark_returns : daily benchmark returns (optional)
+
+        Returns
+        -------
+        dict mapping year (int) → PerformanceResult
+        """
+        strategy_returns = strategy_returns.dropna()
+        results: dict[int, PerformanceResult] = {}
+        for year, group in strategy_returns.groupby(strategy_returns.index.year):
+            bm_year: pd.Series | None = None
+            if benchmark_returns is not None:
+                bm_year = benchmark_returns[benchmark_returns.index.year == year]
+            results[int(year)] = PerformanceMetrics.compute(group, bm_year)
+        return results
+
+    @staticmethod
     def equity_curve(returns: pd.Series, aum_0: float = 100_000.0) -> pd.Series:
         """Convert daily returns to a dollar equity curve."""
         return aum_0 * (1 + returns.fillna(0)).cumprod()
