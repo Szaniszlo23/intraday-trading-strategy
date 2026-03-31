@@ -137,8 +137,11 @@ class Backtester:
         commission_paid = float(
             trades_count * max(cfg.min_comm, cfg.commission * shares)
         )
+        # Slippage: paid on every order (each direction change = one order)
+        # $0.001/share one-way, applied to every fill
+        slippage_paid = float(trades_count * cfg.slippage * shares)
         avg_duration = _avg_trade_duration(exp_arr)
-        return gross_pnl - commission_paid, commission_paid, trades_count, avg_duration
+        return gross_pnl - commission_paid - slippage_paid, commission_paid, trades_count, avg_duration
 
     # ------------------------------------------------------------------
     # Train / test split helper
@@ -321,5 +324,8 @@ class EnhancedBacktester:
         commission_paid = float(
             trades_count * max(cfg.min_comm, cfg.commission * shares)
         )
-        avg_duration = _avg_trade_duration(exp_arr)
-        return gross_pnl - commission_paid, commission_paid, trades_count, avg_duration
+        # Slippage: paid on every order (each direction change = one order)
+        # $0.001/share one-way, applied to every fill
+        slippage_paid   = float(trades_count * cfg.slippage * shares)
+        avg_duration    = _avg_trade_duration(exp_arr)
+        return gross_pnl - commission_paid - slippage_paid, commission_paid, trades_count, avg_duration

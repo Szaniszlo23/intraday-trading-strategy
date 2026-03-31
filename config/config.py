@@ -93,6 +93,7 @@ class StrategyConfig:
     aum_0: float = 100_000.0     # Starting AUM ($)
     commission: float = 0.0035   # Per-share commission ($)
     min_comm: float = 0.35       # Minimum commission per order ($)
+    slippage: float = 0.001      # One-way slippage per share ($) — from paper assumption
 
     # --- Data ---
     symbol: str = "SPY"

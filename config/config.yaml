@@ -20,6 +20,7 @@ strategy:
   aum_0: 100000.0
   commission: 0.0035
   min_comm: 0.35
+  slippage: 0.001             # One-way slippage per share ($) — from paper assumption
 
   # Universe
   symbol: "SPY"
