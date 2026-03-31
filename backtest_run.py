@@ -55,6 +55,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", type=str, default="config/config.yaml")
     parser.add_argument("--optimize", action="store_true",
                         help="Run grid-search parameter optimisation (baseline)")
+    parser.add_argument("--save", type=str, help="Save fetched data to CSV path")
+    
     return parser.parse_args()
 
 
@@ -69,6 +71,11 @@ def load_data(args: argparse.Namespace, app_cfg: AppConfig) -> pd.DataFrame:
     df = fetcher.get_historical_bars(
         app_cfg.strategy.symbol, args.start, args.end, include_extended=True
     )
+    if args.save:
+        Path(args.save).parent.mkdir(parents=True, exist_ok=True)
+        df.to_csv(args.save)
+        print(f"Data saved to {args.save}")
+    
     if df.empty:
         print("ERROR: No data returned. Check your Alpaca credentials and date range.")
         sys.exit(1)
