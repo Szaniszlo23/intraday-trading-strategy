@@ -155,22 +155,39 @@ class EnhancedSignalGenerator:
             long_stop  = max(upper_band[i], vwap_arr[i])
             short_stop = min(lower_band[i], vwap_arr[i])
 
+            # Track whether we were already holding BEFORE this bar's checks
+            was_long  = (current_pos ==  1.0)
+            was_short = (current_pos == -1.0)
+
             # ---- Confirm pending entry at this bar's open ----
+            entered_this_bar = False
             if current_pos == 0.0 and not past_cutoff:
                 if pending_long and open_arr[i] > upper_band[i]:
                     current_pos = 1.0
+                    entered_this_bar = True
                 elif pending_short and open_arr[i] < lower_band[i]:
                     current_pos = -1.0
+                    entered_this_bar = True
             pending_long  = False
             pending_short = False
 
             # ---- VWAP trailing stop exit ----
+            stopped = False
             if current_pos == 1.0 and close_arr[i] < long_stop:
                 current_pos = 0.0
+                stopped = True
             elif current_pos == -1.0 and close_arr[i] > short_stop:
                 current_pos = 0.0
+                stopped = True
 
-            exposure[i] = current_pos
+            # If an EXISTING position (held from a prior bar) was stopped out,
+            # record exposure=1 so _compute_pnl captures the (negative) return
+            # of the bar that triggered the stop.  If we entered AND stopped on
+            # the same bar, exposure=0 is correct (no prior holding period).
+            if stopped and (was_long or was_short) and not entered_this_bar:
+                exposure[i] = 1.0 if was_long else -1.0
+            else:
+                exposure[i] = current_pos
 
             # ---- Pending entry on next bar (only if flat and before cutoff) ----
             if current_pos == 0.0 and not past_cutoff:

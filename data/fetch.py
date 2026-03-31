@@ -311,7 +311,7 @@ class AlpacaFetcher:
             symbol=symbol,
             start=start,
             end=end,
-            include_extended=False,
+            include_extended=True,
         )
 
         if df.empty:

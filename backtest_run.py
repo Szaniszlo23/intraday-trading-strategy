@@ -50,7 +50,7 @@ PLOT_DIR = Path("analysis/plots")
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Intraday Momentum Backtester")
     parser.add_argument("--csv", type=str, help="Path to local CSV data file")
-    parser.add_argument("--start", type=str, default="2024-01-01")
+    parser.add_argument("--start", type=str, default="2016-01-01")
     parser.add_argument("--end", type=str, default="2026-01-01")
     parser.add_argument("--config", type=str, default="config/config.yaml")
     parser.add_argument("--optimize", action="store_true",

@@ -237,8 +237,13 @@ class EnhancedBacktester:
                 raw_day = raw_groups.get_group(current_day)
                 pm_bars  = raw_day.between_time("04:00", "09:29")
                 pm_ret   = Indicators.premarket_return(pm_bars)
-                first_30 = raw_day.between_time("09:30", "09:59").iloc[:30]
-                imbalance = Indicators.order_imbalance(first_30)
+            # Order imbalance uses the PREVIOUS day's first-30 session bars to
+            # avoid intra-day look-ahead (sizing is decided before the session,
+            # so we can only know what happened yesterday, not today 09:30-09:59).
+            if prev_day in raw_groups.groups:
+                raw_prev = raw_groups.get_group(prev_day)
+                first_30_prev = raw_prev.between_time("09:30", "09:59").iloc[:30]
+                imbalance = Indicators.order_imbalance(first_30_prev)
             flow_mult = Indicators.flow_composite_mult(pm_ret, imbalance)
 
             # ---- Sizing ----
