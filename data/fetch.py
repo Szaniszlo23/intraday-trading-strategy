@@ -169,6 +169,7 @@ class AlpacaFetcher:
             start=_to_utc(start),
             end=_to_utc(end),
             adjustment="raw",
+            feed="iex",        # IEX feed — available on free Alpaca tier
         )
 
         logger.info(
