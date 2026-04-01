@@ -29,6 +29,7 @@ import signal
 import sys
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
@@ -52,6 +53,7 @@ _HISTORY_DAYS  = 120              # warm-up window for sigma_open (90-day rollin
 _SESSION_OPEN  = time(9, 30)
 _ENTRY_CUTOFF  = time(15, 30)
 _EOD_CLOSE     = time(15, 59)
+_ET            = ZoneInfo("America/New_York")   # US Eastern — all time comparisons use this
 
 
 # ── V6 Live Trader ────────────────────────────────────────────────────────────
@@ -122,7 +124,7 @@ class LiveTraderV6:
         Fetch HISTORY_DAYS of 1-min bars (including pre-market) and preprocess.
         Derives the per-minute sigma lookup for today's session.
         """
-        end   = datetime.now()
+        end   = datetime.now(_ET)
         start = end - timedelta(days=_HISTORY_DAYS + 15)   # extra buffer for holidays
 
         logger.info("Bootstrapping %d days of history ...", _HISTORY_DAYS)
@@ -182,12 +184,78 @@ class LiveTraderV6:
 
     # ── Session open ──────────────────────────────────────────────────────────
 
+    def _backfill_today(self) -> float | None:
+        """
+        If we joined after 09:30 ET, fetch all bars from 09:30 up to now via
+        REST and prepend them to _today_bars so VWAP and move_open are correct.
+
+        Returns the actual 09:30 open price, or None if back-fill failed.
+        """
+        now_et = datetime.now(_ET)
+        today  = now_et.date()
+
+        session_open_dt = datetime(
+            today.year, today.month, today.day, 9, 30,
+            tzinfo=_ET,
+        )
+
+        # Nothing to back-fill if we're right at the open
+        if now_et <= session_open_dt + timedelta(minutes=1):
+            return None
+
+        logger.info(
+            "Joined after session open — back-filling bars from 09:30 to %s ET ...",
+            now_et.strftime("%H:%M"),
+        )
+        try:
+            missed = self.fetcher.get_historical_bars(
+                self.symbol,
+                start=session_open_dt,
+                end=now_et,
+                include_extended=False,
+            )
+        except Exception as exc:
+            logger.error("Back-fill fetch failed: %s", exc)
+            return None
+
+        if missed.empty:
+            logger.warning("Back-fill returned no bars — VWAP/move_open will be approximate.")
+            return None
+
+        # Prepend to today_bars (they arrive before the triggering WebSocket bar)
+        backfilled = []
+        for ts, row in missed.iterrows():
+            backfilled.append({
+                "open":   float(row["open"]),
+                "high":   float(row["high"]),
+                "low":    float(row["low"]),
+                "close":  float(row["close"]),
+                "volume": float(row["volume"]),
+                "caldt":  ts,
+            })
+
+        # Insert before whatever bar triggered _prepare_session
+        self._today_bars = backfilled + self._today_bars
+
+        actual_open = float(missed["open"].iloc[0])
+        logger.info(
+            "Back-filled %d bars — actual 09:30 open=%.2f", len(backfilled), actual_open
+        )
+        return actual_open
+
     def _prepare_session(self, open_price: float) -> None:
         """
         Called on the very first bar of the day (09:30 ET).
+        If we joined mid-session, back-fills missing bars first so that
+        VWAP, move_open, and position sizing all use the correct 09:30 open.
         Computes all Layer-2 values and fixes position size for the session.
         """
-        today = date.today()
+        today = datetime.now(_ET).date()
+
+        # Back-fill if we missed bars since 09:30
+        actual_open = self._backfill_today()
+        if actual_open is not None:
+            open_price = actual_open
 
         # --- Vol-regime factor ---
         daily_rets = self._hist_daily["ret"].dropna()
@@ -233,11 +301,32 @@ class LiveTraderV6:
 
     # ── Per-bar ───────────────────────────────────────────────────────────────
 
-    def on_bar(self, bar: dict) -> None:
-        """Callback — receives one 1-minute bar from the WebSocket."""
+    def on_bar(self, bar: dict | pd.Series) -> None:
+        """Callback — receives one 1-minute bar from the WebSocket or REST catchup.
+
+        WebSocket path : bar is a pd.Series (from fetch.py _handler)
+                         timestamp lives in bar.name / bar["caldt"]
+        REST catchup   : bar is a plain dict with a "timestamp" key
+        Normalise both into a dict before processing.
+        """
+        self._last_bar_time = datetime.now(_ET)   # heartbeat stamp — always ET-aware
+
+        # ── Normalise pd.Series → dict ────────────────────────────────────
+        if isinstance(bar, pd.Series):
+            ts_raw = bar.name if isinstance(bar.name, (datetime, pd.Timestamp)) \
+                     else bar["caldt"]
+            bar = {
+                "timestamp": ts_raw,
+                "open":   float(bar["open"]),
+                "high":   float(bar["high"]),
+                "low":    float(bar["low"]),
+                "close":  float(bar["close"]),
+                "volume": float(bar["volume"]),
+            }
+
         ts: datetime = bar["timestamp"]
         if hasattr(ts, "tzinfo") and ts.tzinfo is not None:
-            ts = ts.astimezone(tz=None).replace(tzinfo=None)
+            ts = ts.astimezone(_ET).replace(tzinfo=None)
 
         et_time = ts.time()
 
@@ -352,7 +441,7 @@ class LiveTraderV6:
         """
         logger.info("End-of-day refresh — updating historical data ...")
         try:
-            end   = datetime.now()
+            end   = datetime.now(_ET)
             start = end - timedelta(days=_HISTORY_DAYS + 15)
             raw   = self.fetcher.get_historical_bars(
                 self.symbol, start, end, include_extended=True
@@ -393,11 +482,57 @@ class LiveTraderV6:
     # ── Entry point ───────────────────────────────────────────────────────────
 
     def run(self) -> None:
+        import time
+        from datetime import datetime, timedelta
+
         logger.info(
             "Starting V6 live trader — symbol=%s  paper=%s",
             self.symbol, self.cfg.__dict__.get("paper", "?"),
         )
         self.fetcher.stream_bars(self.symbol, self.on_bar)
+        self._last_bar_time: datetime = datetime.now(_ET)
+
+        # ── Heartbeat loop ────────────────────────────────────────────────
+        # Every 60 seconds check if the WebSocket has gone silent.
+        # If no bar has arrived in 90+ seconds during market hours, fall
+        # back to REST to fetch and process the missing bar(s).
+        while True:
+            time.sleep(60)
+
+            now      = datetime.now(_ET)   # always Eastern Time
+            et_time  = now.time()
+
+            # Only check during regular session
+            if not (_SESSION_OPEN <= et_time <= _EOD_CLOSE):
+                continue
+
+            gap = (now - self._last_bar_time).total_seconds()
+            if gap > 90:
+                logger.warning(
+                    "WebSocket silent for %.0fs — fetching missed bars via REST",
+                    gap,
+                )
+                try:
+                    missed = self.fetcher.get_historical_bars(
+                        self.symbol,
+                        start=now - timedelta(minutes=5),
+                        end=now,
+                        include_extended=False,
+                    )
+                    for ts, row in missed.iterrows():
+                        if ts > self._last_bar_time:
+                            bar = {
+                                "timestamp": ts,
+                                "open":   row["open"],
+                                "high":   row["high"],
+                                "low":    row["low"],
+                                "close":  row["close"],
+                                "volume": row["volume"],
+                            }
+                            logger.info("REST catchup bar: %s", ts)
+                            self.on_bar(bar)
+                except Exception as exc:
+                    logger.error("REST catchup failed: %s", exc)
 
 
 # ── Baseline Live Trader (unchanged) ─────────────────────────────────────────
@@ -429,10 +564,21 @@ class LiveTrader:
         logger.info("Starting baseline live trader for %s ...", self.symbol)
         self.fetcher.stream_bars(self.symbol, self.on_bar)
 
-    def on_bar(self, bar: dict) -> None:
+    def on_bar(self, bar: dict | pd.Series) -> None:
+        # Normalise WebSocket pd.Series → dict
+        if isinstance(bar, pd.Series):
+            ts_raw = bar.name if isinstance(bar.name, (datetime, pd.Timestamp)) \
+                     else bar["caldt"]
+            bar = {
+                "timestamp": ts_raw,
+                "open": float(bar["open"]), "high": float(bar["high"]),
+                "low":  float(bar["low"]),  "close": float(bar["close"]),
+                "volume": float(bar["volume"]),
+            }
+
         ts: datetime = bar["timestamp"]
         if hasattr(ts, "tzinfo") and ts.tzinfo is not None:
-            ts = ts.astimezone(tz=None).replace(tzinfo=None)
+            ts = ts.astimezone(_ET).replace(tzinfo=None)
 
         et_time = ts.time()
 
