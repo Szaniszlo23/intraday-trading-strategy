@@ -63,6 +63,8 @@ def parse_args() -> argparse.Namespace:
                         help="Print year-by-year performance breakdown")
     parser.add_argument("--walkforward", action="store_true",
                         help="Walk-forward validation: rolling 2-year OOS windows")
+    parser.add_argument("--longshort", action="store_true",
+                        help="Print long vs short P&L breakdown and plot equity curves")
 
     return parser.parse_args()
 
@@ -411,6 +413,121 @@ def plot_return_distribution(results: dict, colours: list[str], save_path: Path)
     plt.show()
 
 
+def print_long_short_breakdown(name: str, result, save_chart: bool = True) -> None:
+    """
+    Print a year-by-year long vs short P&L breakdown and plot cumulative
+    long / short equity curves.
+
+    Columns shown per year
+    ----------------------
+    Long $    : cumulative gross P&L from long positions that year
+    Short $   : cumulative gross P&L from short positions that year
+    Long %    : long share of total gross P&L (%)
+    Short %   : short share of total gross P&L (%)
+    L-Hit %   : hit rate on long-only trading days
+    S-Hit %   : hit rate on short-only trading days
+    """
+    daily = result.daily.copy()
+    daily["long_pnl"]  = daily["long_pnl"].fillna(0.0)
+    daily["short_pnl"] = daily["short_pnl"].fillna(0.0)
+
+    # ---- Full-period summary ----
+    total_long  = daily["long_pnl"].sum()
+    total_short = daily["short_pnl"].sum()
+    total_gross = total_long + total_short
+    long_share  = 100 * total_long  / total_gross if total_gross != 0 else float("nan")
+    short_share = 100 * total_short / total_gross if total_gross != 0 else float("nan")
+
+    print(f"\n{'═' * 88}")
+    print(f"  {name} — Long / Short P&L Breakdown")
+    print(f"{'═' * 88}")
+    print(f"  Full period:  Long ${total_long:>12,.0f}  ({long_share:.1f}%)   "
+          f"Short ${total_short:>12,.0f}  ({short_share:.1f}%)")
+    print(f"{'─' * 88}")
+    print(
+        f"  {'Year':<6} {'Long $':>10} {'Short $':>10} {'Long%':>7} {'Short%':>7} "
+        f"{'L-Hit%':>7} {'S-Hit%':>7}"
+    )
+    print(f"  {'─'*6} {'─'*10} {'─'*10} {'─'*7} {'─'*7} {'─'*7} {'─'*7}")
+
+    for year, grp in daily.groupby(daily.index.year):
+        y_long  = grp["long_pnl"].sum()
+        y_short = grp["short_pnl"].sum()
+        y_gross = y_long + y_short
+        y_long_pct  = 100 * y_long  / y_gross if y_gross != 0 else float("nan")
+        y_short_pct = 100 * y_short / y_gross if y_gross != 0 else float("nan")
+
+        # Hit rates: days where that side traded AND was profitable
+        long_days  = grp[grp["long_pnl"]  != 0]
+        short_days = grp[grp["short_pnl"] != 0]
+        l_hit = 100 * (long_days["long_pnl"]   > 0).sum() / len(long_days)  if len(long_days)  > 0 else float("nan")
+        s_hit = 100 * (short_days["short_pnl"] > 0).sum() / len(short_days) if len(short_days) > 0 else float("nan")
+
+        l_hit_str = f"{l_hit:>7.1f}" if not np.isnan(l_hit) else f"{'—':>7}"
+        s_hit_str = f"{s_hit:>7.1f}" if not np.isnan(s_hit) else f"{'—':>7}"
+
+        print(
+            f"  {year:<6} {y_long:>10,.0f} {y_short:>10,.0f} "
+            f"{y_long_pct:>7.1f} {y_short_pct:>7.1f} {l_hit_str} {s_hit_str}"
+        )
+
+    print(f"{'═' * 88}")
+
+    if not save_chart:
+        return
+
+    # ---- Chart: cumulative long vs short vs combined ----
+    cum_long  = daily["long_pnl"].cumsum()
+    cum_short = daily["short_pnl"].cumsum()
+    cum_total = (daily["long_pnl"] + daily["short_pnl"]).cumsum()
+
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(13, 9), gridspec_kw={"height_ratios": [3, 1]})
+
+    ax1.plot(cum_long.index,  cum_long.values,  label="Long cumulative P&L",  color="#27AE60", lw=2)
+    ax1.plot(cum_short.index, cum_short.values, label="Short cumulative P&L", color="#E74C3C", lw=2)
+    ax1.plot(cum_total.index, cum_total.values, label="Combined gross P&L",   color="#F39C12", lw=1.5, ls="--")
+    ax1.axhline(0, color="white", lw=0.6, alpha=0.4)
+    ax1.yaxis.set_major_formatter(FuncFormatter(lambda x, _: f"${x:,.0f}"))
+    ax1.xaxis.set_major_formatter(mdates.DateFormatter("%b %Y"))
+    ax1.xaxis.set_major_locator(mdates.MonthLocator(interval=6))
+    ax1.grid(True, ls="--", alpha=0.25)
+    ax1.spines["top"].set_visible(False)
+    ax1.spines["right"].set_visible(False)
+    ax1.legend(fontsize=10)
+    ax1.set_title(
+        f"{name} — Cumulative Gross P&L: Long vs Short\n"
+        f"Long total \\${total_long:,.0f} ({long_share:.1f}%)   "
+        f"Short total \\${total_short:,.0f} ({short_share:.1f}%)",
+        fontweight="bold", fontsize=12,
+    )
+
+    # Bar chart: annual long vs short gross P&L
+    years       = sorted(daily.index.year.unique())
+    long_annual  = [daily[daily.index.year == y]["long_pnl"].sum()  for y in years]
+    short_annual = [daily[daily.index.year == y]["short_pnl"].sum() for y in years]
+    x = np.arange(len(years))
+    w = 0.38
+    ax2.bar(x - w/2, long_annual,  width=w, label="Long",  color="#27AE60", alpha=0.85)
+    ax2.bar(x + w/2, short_annual, width=w, label="Short", color="#E74C3C", alpha=0.85)
+    ax2.axhline(0, color="white", lw=0.6, alpha=0.4)
+    ax2.set_xticks(x)
+    ax2.set_xticklabels(years, fontsize=8)
+    ax2.yaxis.set_major_formatter(FuncFormatter(lambda x, _: f"${x:,.0f}"))
+    ax2.set_title("Annual Gross P&L by Side", fontsize=10)
+    ax2.legend(fontsize=9)
+    ax2.spines["top"].set_visible(False)
+    ax2.spines["right"].set_visible(False)
+    ax2.grid(True, ls="--", alpha=0.2, axis="y")
+
+    plt.xticks(rotation=45, ha="right")
+    plt.tight_layout()
+    PLOT_DIR.mkdir(parents=True, exist_ok=True)
+    save_path = PLOT_DIR / f"long_short_{name.lower().replace(' ', '_')}.png"
+    plt.savefig(save_path, dpi=150)
+    print(f"  Chart saved → {save_path}")
+    plt.show()
+
+
 def _walkforward_windows(
     all_days: list,
     window_years: int = 2,
@@ -712,6 +829,10 @@ def main() -> None:
     if args.yearly:
         print_yearly_breakdown("Baseline", base_result)
         print_yearly_breakdown("Enhanced", enh_result)
+
+    if args.longshort:
+        print_long_short_breakdown("Baseline", base_result)
+        print_long_short_breakdown("Enhanced (V6)", enh_result)
 
     if args.walkforward:
         run_walkforward(df_enh, df_daily_enh, raw, enh_strategy_cfg, window_years=2)

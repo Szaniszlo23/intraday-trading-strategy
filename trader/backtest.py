@@ -82,7 +82,8 @@ class Backtester:
 
         result = pd.DataFrame(
             index=all_days,
-            columns=["ret", "AUM", "ret_spy", "trades", "avg_dur", "avg_lev"],
+            columns=["ret", "AUM", "ret_spy", "trades", "avg_dur", "avg_lev",
+                     "long_pnl", "short_pnl"],
             dtype=float,
         )
         result["AUM"] = cfg.aum_0
@@ -108,13 +109,17 @@ class Backtester:
             exposure = self._signal_gen.generate(cur_df, prev_close)
             shares = self._sizer.shares(prev_aum, open_price, daily_vol)
             leverage = (shares * open_price) / prev_aum if prev_aum > 0 else 0.0
-            net_pnl, _, trades_count, avg_dur = self._compute_pnl(cur_df["close"], exposure, shares)
+            net_pnl, _, trades_count, avg_dur, long_pnl, short_pnl = self._compute_pnl(
+                cur_df["close"], exposure, shares
+            )
 
-            result.loc[current_day, "AUM"]     = prev_aum + net_pnl
-            result.loc[current_day, "ret"]     = net_pnl / prev_aum
-            result.loc[current_day, "trades"]  = trades_count
-            result.loc[current_day, "avg_dur"] = avg_dur
-            result.loc[current_day, "avg_lev"] = leverage if trades_count > 0 else 0.0
+            result.loc[current_day, "AUM"]       = prev_aum + net_pnl
+            result.loc[current_day, "ret"]        = net_pnl / prev_aum
+            result.loc[current_day, "trades"]     = trades_count
+            result.loc[current_day, "avg_dur"]    = avg_dur
+            result.loc[current_day, "avg_lev"]    = leverage if trades_count > 0 else 0.0
+            result.loc[current_day, "long_pnl"]   = long_pnl
+            result.loc[current_day, "short_pnl"]  = short_pnl
             prev_aum = prev_aum + net_pnl
 
             today_dt = pd.Timestamp(current_day)
@@ -130,14 +135,21 @@ class Backtester:
         close_prices: pd.Series,
         exposure: pd.Series,
         shares: int,
-    ) -> tuple[float, float, int, float]:
+    ) -> tuple[float, float, int, float, float, float]:
         cfg = self.config
         exp_arr = exposure.values
         close_arr = close_prices.values
 
         trades_count = int(np.sum(np.abs(np.diff(np.append(exp_arr, 0)))))
         change_1m = np.diff(close_arr, prepend=close_arr[0])
-        gross_pnl = float(np.sum(exp_arr * change_1m) * shares)
+
+        # Split gross P&L into long and short contributions
+        long_mask  = exp_arr > 0
+        short_mask = exp_arr < 0
+        long_gross  = float(np.sum(exp_arr[long_mask]  * change_1m[long_mask])  * shares)
+        short_gross = float(np.sum(exp_arr[short_mask] * change_1m[short_mask]) * shares)
+        gross_pnl   = long_gross + short_gross
+
         commission_paid = float(
             trades_count * max(cfg.min_comm, cfg.commission * shares)
         )
@@ -145,7 +157,14 @@ class Backtester:
         # $0.001/share one-way, applied to every fill
         slippage_paid = float(trades_count * cfg.slippage * shares)
         avg_duration = _avg_trade_duration(exp_arr)
-        return gross_pnl - commission_paid - slippage_paid, commission_paid, trades_count, avg_duration
+        return (
+            gross_pnl - commission_paid - slippage_paid,
+            commission_paid,
+            trades_count,
+            avg_duration,
+            long_gross,
+            short_gross,
+        )
 
     # ------------------------------------------------------------------
     # Train / test split helper
@@ -237,7 +256,8 @@ class EnhancedBacktester:
 
         result = pd.DataFrame(
             index=all_days,
-            columns=["ret", "AUM", "ret_spy", "trades", "avg_dur", "avg_lev"],
+            columns=["ret", "AUM", "ret_spy", "trades", "avg_dur", "avg_lev",
+                     "long_pnl", "short_pnl"],
             dtype=float,
         )
         result["AUM"] = cfg.aum_0
@@ -314,12 +334,16 @@ class EnhancedBacktester:
             leverage = (shares * open_price) / prev_aum if prev_aum > 0 else 0.0
 
             # ---- P&L ----
-            net_pnl, _, trades_count, avg_dur = self._compute_pnl(cur_df["close"], exposure, shares)
-            result.loc[current_day, "AUM"]     = prev_aum + net_pnl
-            result.loc[current_day, "ret"]     = net_pnl / prev_aum
-            result.loc[current_day, "trades"]  = trades_count
-            result.loc[current_day, "avg_dur"] = avg_dur
-            result.loc[current_day, "avg_lev"] = leverage if trades_count > 0 else 0.0
+            net_pnl, _, trades_count, avg_dur, long_pnl, short_pnl = self._compute_pnl(
+                cur_df["close"], exposure, shares
+            )
+            result.loc[current_day, "AUM"]       = prev_aum + net_pnl
+            result.loc[current_day, "ret"]        = net_pnl / prev_aum
+            result.loc[current_day, "trades"]     = trades_count
+            result.loc[current_day, "avg_dur"]    = avg_dur
+            result.loc[current_day, "avg_lev"]    = leverage if trades_count > 0 else 0.0
+            result.loc[current_day, "long_pnl"]   = long_pnl
+            result.loc[current_day, "short_pnl"]  = short_pnl
             prev_aum = prev_aum + net_pnl
 
             today_dt = pd.Timestamp(current_day)
@@ -335,19 +359,33 @@ class EnhancedBacktester:
         close_prices: pd.Series,
         exposure: pd.Series,
         shares: int,
-    ) -> tuple[float, float, int, float]:
+    ) -> tuple[float, float, int, float, float, float]:
         cfg = self.config
         exp_arr   = exposure.values
         close_arr = close_prices.values
 
-        trades_count    = int(np.sum(np.abs(np.diff(np.append(exp_arr, 0)))))
-        change_1m       = np.diff(close_arr, prepend=close_arr[0])
-        gross_pnl       = float(np.sum(exp_arr * change_1m) * shares)
+        trades_count = int(np.sum(np.abs(np.diff(np.append(exp_arr, 0)))))
+        change_1m    = np.diff(close_arr, prepend=close_arr[0])
+
+        # Split gross P&L into long and short contributions
+        long_mask   = exp_arr > 0
+        short_mask  = exp_arr < 0
+        long_gross  = float(np.sum(exp_arr[long_mask]  * change_1m[long_mask])  * shares)
+        short_gross = float(np.sum(exp_arr[short_mask] * change_1m[short_mask]) * shares)
+        gross_pnl   = long_gross + short_gross
+
         commission_paid = float(
             trades_count * max(cfg.min_comm, cfg.commission * shares)
         )
         # Slippage: paid on every order (each direction change = one order)
         # $0.001/share one-way, applied to every fill
-        slippage_paid   = float(trades_count * cfg.slippage * shares)
-        avg_duration    = _avg_trade_duration(exp_arr)
-        return gross_pnl - commission_paid - slippage_paid, commission_paid, trades_count, avg_duration
+        slippage_paid = float(trades_count * cfg.slippage * shares)
+        avg_duration  = _avg_trade_duration(exp_arr)
+        return (
+            gross_pnl - commission_paid - slippage_paid,
+            commission_paid,
+            trades_count,
+            avg_duration,
+            long_gross,
+            short_gross,
+        )
