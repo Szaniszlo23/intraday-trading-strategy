@@ -61,6 +61,8 @@ def parse_args() -> argparse.Namespace:
                         help="Isolate each enhancement one at a time (6 variants)")
     parser.add_argument("--yearly", action="store_true",
                         help="Print year-by-year performance breakdown")
+    parser.add_argument("--walkforward", action="store_true",
+                        help="Walk-forward validation: rolling 2-year OOS windows")
 
     return parser.parse_args()
 
@@ -409,6 +411,227 @@ def plot_return_distribution(results: dict, colours: list[str], save_path: Path)
     plt.show()
 
 
+def _walkforward_windows(
+    all_days: list,
+    window_years: int = 2,
+) -> list[tuple[list, list]]:
+    """
+    Build non-overlapping out-of-sample windows of `window_years` each.
+
+    The dataset is divided into sequential blocks of equal size (in calendar
+    years).  Every block is a fully independent OOS period — there is no
+    separate training phase because V6 has no parameters to optimise.
+
+    Example with 10 years of data (2016–2025) and window_years=2:
+      Block 1 OOS: 2016–2017
+      Block 2 OOS: 2018–2019
+      Block 3 OOS: 2020–2021
+      Block 4 OOS: 2022–2023
+      Block 5 OOS: 2024–2025
+
+    Parameters
+    ----------
+    all_days     : sorted list of datetime.date objects covering the full dataset
+    window_years : size of each OOS window in calendar years (default 2)
+
+    Returns
+    -------
+    List of (anchor_day, test_days) tuples where anchor_day is the last trading
+    day *before* the window (needed for prev_close on day 1 of each window) and
+    test_days is the list of trading dates inside the window.
+    """
+    if not all_days:
+        return []
+
+    start = pd.Timestamp(all_days[0])
+    end   = pd.Timestamp(all_days[-1])
+    days_ts = pd.to_datetime(all_days)
+
+    windows = []
+    window_start = start
+    while window_start < end:
+        window_end = window_start + pd.DateOffset(years=window_years)
+        if window_end > end:
+            window_end = end + pd.Timedelta(days=1)   # include the last partial block
+
+        test_mask = (days_ts >= window_start) & (days_ts < window_end)
+        test_days = [d for d, m in zip(all_days, test_mask) if m]
+        if not test_days:
+            break
+
+        # Anchor = last trading day that comes strictly before the window
+        prior_days = [d for d in all_days if pd.Timestamp(d) < window_start]
+        anchor_day = prior_days[-1] if prior_days else test_days[0]
+
+        windows.append((anchor_day, test_days))
+        window_start = window_end
+
+    return windows
+
+
+def run_walkforward(
+    df_enh: pd.DataFrame,
+    df_daily_enh: pd.DataFrame,
+    raw: pd.DataFrame,
+    cfg: "StrategyConfig",
+    window_years: int = 2,
+) -> None:
+    """
+    Walk-forward validation for V6 (Full Enhanced strategy).
+
+    Divides the preprocessed dataset into sequential non-overlapping blocks
+    of `window_years` each.  V6 is run independently on every block, using
+    only the data in that block (no training / parameter optimisation needed
+    because all features are already lag-safe).  OOS returns from every block
+    are concatenated and treated as a single combined out-of-sample track record.
+
+    Outputs
+    -------
+    - Console table: one row per window + combined OOS row
+    - Chart: combined OOS equity curve vs SPY, saved to
+             analysis/plots/walkforward.png
+    """
+    all_days = sorted(df_enh["day"].unique())
+    windows  = _walkforward_windows(all_days, window_years=window_years)
+
+    if not windows:
+        print("  Not enough data for walk-forward windows.")
+        return
+
+    # Pre-group raw extended bars by date for fast lookup
+    raw_copy = raw.copy()
+    if "day" not in raw_copy.columns:
+        raw_copy["day"] = raw_copy.index.date
+    raw_copy["day"] = pd.to_datetime(raw_copy["day"]).dt.date
+    raw_groups = raw_copy.groupby("day")
+
+    print(f"\n{'═' * 82}")
+    print(f"  {'WALK-FORWARD VALIDATION  (V6 Full Enhanced — {window_years}-year OOS windows)':^80}".format(window_years=window_years))
+    print(f"{'═' * 82}")
+    print(
+        f"  {'Window':<18} {'Ann Ret%':>9} {'Sharpe':>7} {'MaxDD%':>8} "
+        f"{'Hit%':>7} {'N Days':>7} {'Avg Lev':>8}"
+    )
+    print(f"  {'─'*18} {'─'*9} {'─'*7} {'─'*8} {'─'*7} {'─'*7} {'─'*8}")
+
+    all_oos_rets: list[pd.Series] = []
+    all_oos_spy:  list[pd.Series] = []
+
+    for anchor_day, test_days in windows:
+        test_set   = set(test_days)
+        window_set = test_set | {anchor_day}
+
+        # Slice preprocessed data to this window (+ anchor day for prev_close)
+        df_w  = df_enh[df_enh["day"].isin(window_set)]
+        dd_w  = df_daily_enh[
+            df_daily_enh.index.isin(pd.to_datetime(list(window_set)))
+        ]
+
+        # Raw extended bars for the same window
+        raw_day_set = test_set | {anchor_day}
+        raw_w_days  = [d for d in raw_copy["day"].unique() if d in raw_day_set]
+        raw_w       = raw_copy[raw_copy["day"].isin(raw_w_days)]
+
+        result = EnhancedBacktester(cfg).run(df_w, dd_w, raw_w)
+
+        # Keep only the OOS test period (drop anchor day)
+        test_start = pd.Timestamp(test_days[0])
+        oos_rets   = result.returns[result.returns.index >= test_start]
+        oos_spy    = result.daily["ret_spy"][result.daily.index >= test_start]
+
+        if oos_rets.empty:
+            continue
+
+        all_oos_rets.append(oos_rets)
+        all_oos_spy.append(oos_spy)
+
+        m       = PerformanceMetrics.compute(oos_rets, oos_spy)
+        lev_col = result.daily["avg_lev"][result.daily.index >= test_start].replace(0.0, float("nan"))
+        avg_lev = lev_col.mean()
+        lev_str = f"{avg_lev:.2f}x" if not np.isnan(avg_lev) else "—"
+
+        year_start = pd.Timestamp(test_days[0]).year
+        year_end   = pd.Timestamp(test_days[-1]).year
+        label      = f"{year_start}–{year_end}" if year_start != year_end else str(year_start)
+
+        print(
+            f"  {label:<18} {m.annualized_return:>9.1f} {m.sharpe_ratio:>7.2f} "
+            f"{m.max_drawdown:>8.1f} {m.hit_ratio:>7.1f} {len(oos_rets):>7} {lev_str:>8}"
+        )
+
+    if not all_oos_rets:
+        print("  No OOS results to aggregate.")
+        return
+
+    # ---- Combined OOS row ----
+    combined_rets = pd.concat(all_oos_rets).sort_index()
+    combined_spy  = pd.concat(all_oos_spy).sort_index()
+    cm = PerformanceMetrics.compute(combined_rets, combined_spy)
+    all_lev = pd.concat(
+        [r.replace(0.0, float("nan")) for r in all_oos_rets]   # reuse oos_rets as proxy
+    )
+    # Recalculate combined avg_lev from results (collect separately)
+    print(f"  {'─'*18} {'─'*9} {'─'*7} {'─'*8} {'─'*7} {'─'*7} {'─'*8}")
+    print(
+        f"  {'Combined OOS':<18} {cm.annualized_return:>9.1f} {cm.sharpe_ratio:>7.2f} "
+        f"{cm.max_drawdown:>8.1f} {cm.hit_ratio:>7.1f} {len(combined_rets):>7} {'':>8}"
+    )
+    print(f"{'═' * 82}")
+
+    # ---- Chart ----
+    PLOT_DIR.mkdir(parents=True, exist_ok=True)
+    fig, ax = plt.subplots(figsize=(13, 7))
+
+    aum_0 = cfg.aum_0
+    oos_aum = aum_0 * (1 + combined_rets).cumprod()
+    spy_aum = aum_0 * (1 + combined_spy.reindex(combined_rets.index).fillna(0)).cumprod()
+
+    ax.plot(oos_aum.index, oos_aum.values,
+            label="V6 Enhanced — Combined OOS", color="#27AE60", lw=2.2)
+    ax.plot(spy_aum.index, spy_aum.values,
+            label="SPY Buy & Hold", color="#E74C3C", lw=1.8, ls="--")
+
+    # Shade each OOS window alternately
+    shade_colours = ["#1A3A2A", "#0D1F33"]
+    for idx, (_, test_days) in enumerate(windows):
+        x0 = pd.Timestamp(test_days[0])
+        x1 = pd.Timestamp(test_days[-1])
+        ax.axvspan(x0, x1, alpha=0.18, color=shade_colours[idx % 2], lw=0)
+
+    # Annotate each window with its Sharpe
+    for _, test_days in windows:
+        ts  = pd.Timestamp(test_days[0])
+        te  = pd.Timestamp(test_days[-1])
+        mid = ts + (te - ts) / 2
+        w_rets = combined_rets[(combined_rets.index >= ts) & (combined_rets.index <= te)]
+        w_spy  = combined_spy[(combined_spy.index >= ts) & (combined_spy.index <= te)]
+        if len(w_rets) > 10:
+            wm = PerformanceMetrics.compute(w_rets, w_spy)
+            y_pos = oos_aum[oos_aum.index <= te].iloc[-1] * 1.02
+            ax.text(mid, y_pos, f"SR {wm.sharpe_ratio:.2f}",
+                    ha="center", va="bottom", fontsize=8, color="#AAAAAA")
+
+    ax.yaxis.set_major_formatter(FuncFormatter(lambda x, _: f"${x:,.0f}"))
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%b %Y"))
+    ax.xaxis.set_major_locator(mdates.MonthLocator(interval=6))
+    plt.xticks(rotation=45, ha="right")
+    ax.grid(True, ls="--", alpha=0.25)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.set_title(
+        f"Walk-Forward Validation — V6 Enhanced  ({window_years}-year OOS windows)\n"
+        f"Combined OOS: Ann Ret {cm.annualized_return:.1f}%  |  Sharpe {cm.sharpe_ratio:.2f}"
+        f"  |  MaxDD {cm.max_drawdown:.1f}%",
+        fontweight="bold", fontsize=12,
+    )
+    ax.legend(fontsize=10)
+    plt.tight_layout()
+    save_path = PLOT_DIR / "walkforward.png"
+    plt.savefig(save_path, dpi=150)
+    print(f"\n  Chart saved → {save_path}")
+    plt.show()
+
+
 def run_grid_search(df, df_daily, base_cfg: StrategyConfig, train_ratio: float = 0.70):
     param_grid = {
         "band_mult":    [0.5, 1.0, 1.5],
@@ -489,6 +712,9 @@ def main() -> None:
     if args.yearly:
         print_yearly_breakdown("Baseline", base_result)
         print_yearly_breakdown("Enhanced", enh_result)
+
+    if args.walkforward:
+        run_walkforward(df_enh, df_daily_enh, raw, enh_strategy_cfg, window_years=2)
 
     if args.variants:
         run_variants(raw, raw_session, app_cfg)
