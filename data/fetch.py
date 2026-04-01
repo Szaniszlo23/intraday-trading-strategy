@@ -1,28 +1,24 @@
 """
 Market data fetcher backed by the Alpaca API.
 
-Provides:
-  AlpacaFetcher.get_historical_bars()  — historical 1-min OHLCV, full day
-                                         including pre-market (04:00–16:00)
-  AlpacaFetcher.get_daily_bars()       — daily OHLCV for vol scaler
-  AlpacaFetcher.get_premarket_bars()   — 04:00–09:29 bars for flow composite
-  AlpacaFetcher.stream_bars()          — real-time WebSocket, non-blocking
-  AlpacaFetcher.stop_stream()          — graceful shutdown
-  AlpacaFetcher.from_csv()             — CSV fallback (offline / backtesting)
+Public interface
+----------------
+  AlpacaFetcher.get_historical_bars() — 1-min OHLCV over a date range,
+                                        includes pre-market by default
+  AlpacaFetcher.stream_bars()         — real-time WebSocket (non-blocking)
+  AlpacaFetcher.stop_stream()         — graceful WebSocket shutdown
+  AlpacaFetcher.from_csv()            — CSV fallback for offline backtesting
 
 Design notes
 ------------
-- The historical client is instantiated once in __init__ and reused across
-  all REST calls — not re-created on every fetch.
-- get_historical_bars() does NOT filter to market hours. The caller is
-  responsible for filtering. This keeps pre-market bars available for the
-  flow composite and backtest pre-market derivation.
-- All timestamps are returned as tz-naive Eastern Time for consistency
-  with the strategy's time-of-day comparisons.
-- stream_bars() is non-blocking. It launches the WebSocket in a background
-  thread and returns immediately. Call stop_stream() to shut down.
-- The WebSocket callback receives a pd.Series with the same column names
-  as the historical DataFrame — no format mismatch with the strategy core.
+- The REST client is created once in __init__ and reused across all calls.
+- get_historical_bars() does NOT filter to market hours by default.
+  Pass include_extended=False or call df.between_time("09:30", "16:00") yourself.
+- All timestamps are returned as tz-naive Eastern Time for consistent
+  comparison with the strategy's time-of-day constants.
+- stream_bars() is non-blocking: it starts the WebSocket in a background
+  thread and returns immediately. The callback receives a pd.Series with
+  the same column names as the historical DataFrame.
 """
 
 from __future__ import annotations
@@ -34,54 +30,41 @@ from pathlib import Path
 from typing import Callable
 
 import pandas as pd
-
 import sys
-from pathlib import Path
 
-# Make project root importable regardless of how this file is invoked
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from config.config import AlpacaConfig
 
 logger = logging.getLogger(__name__)
 
-# Column order guaranteed by every method
+# Guaranteed column order for every returned DataFrame
 _COLUMNS = ["open", "high", "low", "close", "volume"]
 
-# Market session boundaries — inclusive
+# Session boundaries used by include_extended=False filter
 _SESSION_OPEN  = "09:30"
-_SESSION_CLOSE = "16:00"   # FIX: was 15:59, missed the EOD force-close bar
+_SESSION_CLOSE = "16:00"
 
-# Pre-market window
+# Pre-market window (used by callers that need pre-market bars)
 _PREMARKET_OPEN  = "04:00"
 _PREMARKET_CLOSE = "09:29"
 
 
 class AlpacaFetcher:
-    """
-    Single entry point for all Alpaca market data.
-
-    Parameters
-    ----------
-    config : AlpacaConfig, optional
-        API credentials and settings. Reads from environment if not provided.
-    """
+    """Single entry point for all Alpaca market data."""
 
     def __init__(self, config: AlpacaConfig | None = None) -> None:
         self.config = config or AlpacaConfig()
-        self._stream        = None          # StockDataStream instance
-        self._stream_thread = None          # background thread for stream
-        self._hist_client   = None          # lazily initialised REST client
+        self._stream        = None   # StockDataStream instance (live only)
+        self._stream_thread = None   # background thread running the stream
+        self._hist_client   = None   # REST client — created once, reused
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
 
     def _get_hist_client(self):
-        """
-        Return the historical data client, creating it once if needed.
-        FIX: was instantiated inside the method on every call — now cached.
-        """
+        """Return the REST client, creating it on first call."""
         if self._hist_client is None:
             from alpaca.data.historical.stock import StockHistoricalDataClient
             self._hist_client = StockHistoricalDataClient(
@@ -97,17 +80,17 @@ class AlpacaFetcher:
           - flatten MultiIndex if present
           - convert index to tz-naive Eastern Time
           - keep only the five OHLCV columns
-          - add a 'day' column (datetime.date) for easy grouping
+          - add a 'day' column (datetime.date) for grouping
         """
         if df.empty:
             return pd.DataFrame(columns=_COLUMNS)
 
-        # Flatten symbol level from MultiIndex
+        # Flatten the symbol level that Alpaca adds to the index
         if isinstance(df.index, pd.MultiIndex):
             df = df.loc[symbol] if symbol in df.index.get_level_values(0) \
                  else df.reset_index(level=0, drop=True)
 
-        # tz-aware → Eastern → strip tz so comparisons stay simple
+        # Convert to Eastern Time and strip tzinfo for naive comparisons
         if df.index.tz is not None:
             df.index = df.index.tz_convert("America/New_York").tz_localize(None)
         df.index.name = "caldt"
@@ -131,32 +114,18 @@ class AlpacaFetcher:
         """
         Fetch 1-minute OHLCV bars from Alpaca for the given date range.
 
-        FIX 1: Does NOT filter to market hours — all sessions included
-                by default so pre-market bars are available for:
-                  - flow composite (pre-market trend factor)
-                  - backtest pre-market derivation
-                Callers that want regular-session-only data should call
-                  df = df.between_time("09:30", "16:00")
-                themselves.
-
-        FIX 2: MARKET_CLOSE corrected to 16:00 (was 15:59).
-
         Parameters
         ----------
-        symbol : str
-            e.g. "SPY"
-        start, end : str | datetime
-            Date range. Strings like "2019-01-01" are accepted.
-        include_extended : bool
-            True  → includes pre-market (04:00–09:29) and post-market bars.
-            False → regular session only (09:30–16:00).
-            Default True for backtest and noise area lookback fetches.
+        symbol           : ticker, e.g. "SPY"
+        start, end       : date range — strings like "2019-01-01" or datetime objects
+        include_extended : True (default) returns all sessions including pre-market
+                           (04:00–09:29). Pass False to get 09:30–16:00 only.
 
         Returns
         -------
         pd.DataFrame
             Columns: open, high, low, close, volume, day
-            Index: caldt (tz-naive Eastern, 1-min frequency)
+            Index  : caldt (tz-naive Eastern, 1-min frequency)
         """
         from alpaca.data.historical.stock import StockBarsRequest
         from alpaca.data.timeframe import TimeFrame
@@ -169,6 +138,7 @@ class AlpacaFetcher:
             start=_to_utc(start),
             end=_to_utc(end),
             adjustment="raw",
+            feed="iex",   # IEX feed — available on the free Alpaca tier
         )
 
         logger.info(
@@ -187,167 +157,10 @@ class AlpacaFetcher:
 
         df = self._normalise(df, symbol)
 
-        # Optionally restrict to regular session
         if not include_extended:
             df = df.between_time(_SESSION_OPEN, _SESSION_CLOSE)
 
         return df
-
-    # ------------------------------------------------------------------
-    # Daily bars — for vol scaler
-    # ------------------------------------------------------------------
-
-    def get_daily_bars(
-        self,
-        symbol: str,
-        lookback_days: int = 60,
-    ) -> pd.DataFrame:
-        """
-        Fetch daily OHLCV bars for the volatility scaler.
-
-        FIX 5: Was completely missing — vol scaler had no data source.
-
-        Returns the last `lookback_days` complete trading days, with
-        a tz-naive date index (not datetime).
-
-        Parameters
-        ----------
-        symbol : str
-            e.g. "SPY"
-        lookback_days : int
-            Number of trading days to fetch (default 60 for safety margin).
-
-        Returns
-        -------
-        pd.DataFrame
-            Columns: open, high, low, close, volume
-            Index: date (tz-naive, daily frequency)
-        """
-        from alpaca.data.historical.stock import StockBarsRequest
-        from alpaca.data.timeframe import TimeFrame
-        from datetime import timedelta
-
-        client = self._get_hist_client()
-
-        end   = datetime.now(tz=timezone.utc)
-        # Buffer ×2 to account for weekends and holidays
-        start = end - timedelta(days=lookback_days * 2)
-
-        request = StockBarsRequest(
-            symbol_or_symbols=symbol,
-            timeframe=TimeFrame.Day,
-            start=start,
-            end=end,
-            adjustment="raw",
-        )
-
-        logger.info("Fetching daily bars: %s  last %d days", symbol, lookback_days)
-
-        bars = client.get_stock_bars(request)
-        df   = bars.df
-
-        if df.empty:
-            logger.warning("Alpaca returned no daily data for %s", symbol)
-            return pd.DataFrame(columns=_COLUMNS)
-
-        # Flatten MultiIndex if present
-        if isinstance(df.index, pd.MultiIndex):
-            df = df.loc[symbol] if symbol in df.index.get_level_values(0) \
-                 else df.reset_index(level=0, drop=True)
-
-        if df.index.tz is not None:
-            df.index = df.index.tz_convert("America/New_York").tz_localize(None)
-
-        df.index.name = "date"
-        df = df[_COLUMNS].copy()
-
-        # Return only the requested number of days
-        return df.tail(lookback_days)
-
-    # ------------------------------------------------------------------
-    # Pre-market bars — for flow composite
-    # ------------------------------------------------------------------
-
-    def get_premarket_bars(
-        self,
-        symbol: str,
-        trading_date: datetime | None = None,
-    ) -> pd.DataFrame:
-        """
-        Fetch pre-market bars (04:00–09:29) for a given trading date.
-
-        FIX: Was completely missing — flow composite had no data source.
-
-        Called at 09:29 each morning before the session open.
-        Filters the full day's extended-hours bars to the pre-market window.
-
-        Parameters
-        ----------
-        symbol : str
-            e.g. "SPY"
-        trading_date : datetime, optional
-            The session date. Defaults to today.
-
-        Returns
-        -------
-        pd.DataFrame
-            Subset of 1-min bars between 04:00 and 09:29 Eastern.
-            Columns: open, high, low, close, volume, day
-        """
-        from datetime import date, timedelta
-
-        if trading_date is None:
-            trading_date = datetime.now()
-
-        # Fetch the full day including extended hours
-        start = datetime(
-            trading_date.year, trading_date.month, trading_date.day, 4, 0
-        )
-        end = datetime(
-            trading_date.year, trading_date.month, trading_date.day, 9, 30
-        )
-
-        df = self.get_historical_bars(
-            symbol=symbol,
-            start=start,
-            end=end,
-            include_extended=True,
-        )
-
-        if df.empty:
-            return df
-
-        # Filter to strict pre-market window
-        df = df.between_time(_PREMARKET_OPEN, _PREMARKET_CLOSE)
-        return df
-
-    # ------------------------------------------------------------------
-    # Convenience: derive daily returns from 1-min bars
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def daily_returns_from_bars(bars: pd.DataFrame) -> pd.Series:
-        """
-        Derive daily close-to-close returns from a 1-minute bar DataFrame.
-
-        Useful in backtesting where daily bars are not fetched separately —
-        the same intraday DataFrame can produce vol scaler inputs.
-
-        Takes the close of the last bar in each regular session
-        (between_time 09:30–16:00) as the daily close.
-
-        Returns
-        -------
-        pd.Series
-            Daily simple returns, indexed by date.
-        """
-        regular = bars.between_time(_SESSION_OPEN, _SESSION_CLOSE)
-        daily_close = (
-            regular["close"]
-            .groupby(regular["day"])
-            .last()
-        )
-        return daily_close.pct_change().dropna()
 
     # ------------------------------------------------------------------
     # Real-time WebSocket streaming
@@ -361,19 +174,12 @@ class AlpacaFetcher:
         """
         Subscribe to real-time 1-minute bars via Alpaca WebSocket.
 
-        FIX 2: Non-blocking — launches stream in a background thread.
-                Call stop_stream() to shut down gracefully.
+        Non-blocking: launches the stream in a background daemon thread.
+        Call stop_stream() to shut down gracefully.
 
-        FIX 6: callback receives a pd.Series with the same column names
-                as the historical DataFrame, not a plain dict.
-                Series fields: open, high, low, close, volume, symbol, caldt
-
-        Parameters
-        ----------
-        symbol : str
-            e.g. "SPY"
-        callback : Callable[[pd.Series], None]
-            Called with a pd.Series on each new 1-minute bar close.
+        The callback receives a pd.Series with fields:
+            open, high, low, close, volume, symbol, caldt
+        (same column names as the historical DataFrame rows)
         """
         from alpaca.data.live import StockDataStream
 
@@ -383,19 +189,19 @@ class AlpacaFetcher:
         )
 
         async def _handler(bar):
-            # Convert to pd.Series — same format as historical DataFrame rows
+            # Convert Alpaca bar object to a pd.Series matching the historical format
             ts = pd.Timestamp(bar.timestamp)
             if ts.tz is not None:
                 ts = ts.tz_convert("America/New_York").tz_localize(None)
 
             series = pd.Series({
-                "open":    bar.open,
-                "high":    bar.high,
-                "low":     bar.low,
-                "close":   bar.close,
-                "volume":  bar.volume,
-                "symbol":  bar.symbol,
-                "caldt":   ts,
+                "open":   bar.open,
+                "high":   bar.high,
+                "low":    bar.low,
+                "close":  bar.close,
+                "volume": bar.volume,
+                "symbol": bar.symbol,
+                "caldt":  ts,
             }, name=ts)
 
             callback(series)
@@ -404,7 +210,6 @@ class AlpacaFetcher:
 
         logger.info("Starting Alpaca WebSocket stream for %s ...", symbol)
 
-        # FIX 2: run in background thread — does not block the caller
         self._stream_thread = threading.Thread(
             target=self._stream.run,
             daemon=True,
@@ -416,8 +221,8 @@ class AlpacaFetcher:
         """
         Gracefully stop the WebSocket stream.
 
-        FIX: Was completely missing — no way to stop the stream.
-        Call at 16:00 EOD or on KeyboardInterrupt.
+        Call at EOD or on KeyboardInterrupt to cleanly shut down the
+        background thread before exiting.
         """
         if self._stream is not None:
             try:
@@ -433,7 +238,7 @@ class AlpacaFetcher:
             self._stream_thread = None
 
     # ------------------------------------------------------------------
-    # CSV fallback — unchanged, works correctly
+    # CSV fallback — offline backtesting
     # ------------------------------------------------------------------
 
     @staticmethod
@@ -441,8 +246,8 @@ class AlpacaFetcher:
         """
         Load historical data from a local CSV file.
 
-        Useful for fully offline backtesting without any API calls.
         The CSV should have been saved from get_historical_bars() output.
+        Useful for fully offline backtesting without any API calls.
         """
         df = pd.read_csv(path)
 
@@ -461,11 +266,11 @@ class AlpacaFetcher:
 
 
 # ------------------------------------------------------------------
-# Helpers
+# Module-level helper
 # ------------------------------------------------------------------
 
 def _to_utc(dt: str | datetime) -> datetime:
-    """Coerce any date/string input to a UTC-aware datetime."""
+    """Coerce any date string or datetime to a UTC-aware datetime."""
     if isinstance(dt, str):
         dt = pd.Timestamp(dt).to_pydatetime()
     if isinstance(dt, pd.Timestamp):

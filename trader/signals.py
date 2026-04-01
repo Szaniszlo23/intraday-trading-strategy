@@ -36,6 +36,7 @@ import pandas as pd
 
 from config.config import StrategyConfig
 
+# No new entries after 15:30 — existing positions can still be stopped out by VWAP
 _ENTRY_CUTOFF_MINUTES = 15 * 60 + 30  # 15:30 in minutes since midnight
 
 
@@ -69,17 +70,18 @@ class SignalGenerator:
         lower_band = min(open_price, prev_close) * (1 - cfg.band_mult * sigma)
 
         raw = pd.Series(0.0, index=day_df.index)
-        long_cond = (close_prices > upper_band) & (close_prices > vwap)
+        long_cond  = (close_prices > upper_band) & (close_prices > vwap)
         short_cond = (close_prices < lower_band) & (close_prices < vwap)
 
-        raw[long_cond] = 1.0
+        raw[long_cond]  = 1.0
         raw[short_cond] = -1.0
 
-        # Sample at trade_freq intervals only
+        # Sample at trade_freq-minute intervals (e.g. every 30 min for baseline)
         trade_mask = (day_df["min_from_open"] % cfg.trade_freq == 0)
         sampled = pd.Series(np.nan, index=day_df.index)
         sampled[trade_mask] = raw[trade_mask]
 
+        # Forward-fill sampled signal, then shift by 1 bar (execution delay)
         exposure = self._forward_fill(sampled)
         return exposure.shift(1).fillna(0.0)
 
