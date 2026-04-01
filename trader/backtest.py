@@ -81,7 +81,9 @@ class Backtester:
         daily_groups = df.groupby("day")
 
         result = pd.DataFrame(
-            index=all_days, columns=["ret", "AUM", "ret_spy", "trades", "avg_dur"], dtype=float
+            index=all_days,
+            columns=["ret", "AUM", "ret_spy", "trades", "avg_dur", "avg_lev"],
+            dtype=float,
         )
         result["AUM"] = cfg.aum_0
         prev_aum = cfg.aum_0
@@ -105,12 +107,14 @@ class Backtester:
 
             exposure = self._signal_gen.generate(cur_df, prev_close)
             shares = self._sizer.shares(prev_aum, open_price, daily_vol)
+            leverage = (shares * open_price) / prev_aum if prev_aum > 0 else 0.0
             net_pnl, _, trades_count, avg_dur = self._compute_pnl(cur_df["close"], exposure, shares)
 
             result.loc[current_day, "AUM"]     = prev_aum + net_pnl
             result.loc[current_day, "ret"]     = net_pnl / prev_aum
             result.loc[current_day, "trades"]  = trades_count
             result.loc[current_day, "avg_dur"] = avg_dur
+            result.loc[current_day, "avg_lev"] = leverage if trades_count > 0 else 0.0
             prev_aum = prev_aum + net_pnl
 
             today_dt = pd.Timestamp(current_day)
@@ -194,9 +198,13 @@ class EnhancedBacktester:
         config: StrategyConfig | None = None,
         signal_gen: EnhancedSignalGenerator | None = None,
         use_layer2: bool = True,
+        use_day_filter: bool = False,
+        day_filter_threshold: float = 0.30,
     ) -> None:
         self.config = config or StrategyConfig()
         self.use_layer2 = use_layer2
+        self.use_day_filter = use_day_filter
+        self.day_filter_threshold = day_filter_threshold
         self._signal_gen = signal_gen or EnhancedSignalGenerator(self.config)
         self._sizer: EnhancedPositionSizer | PositionSizer = (
             EnhancedPositionSizer() if use_layer2 else PositionSizer(self.config)
@@ -228,7 +236,9 @@ class EnhancedBacktester:
         daily_groups = df.groupby("day")
 
         result = pd.DataFrame(
-            index=all_days, columns=["ret", "AUM", "ret_spy", "trades", "avg_dur"], dtype=float
+            index=all_days,
+            columns=["ret", "AUM", "ret_spy", "trades", "avg_dur", "avg_lev"],
+            dtype=float,
         )
         result["AUM"] = cfg.aum_0
         prev_aum = cfg.aum_0
@@ -262,6 +272,15 @@ class EnhancedBacktester:
             # ---- Signals ----
             exposure = self._signal_gen.generate(cur_df, prev_close)
 
+            # ---- Day-type filter ----
+            # Skip choppy days where the opening range (first 15 min) is small
+            # relative to the previous day's full range.  Applied after signal
+            # generation so the filter is orthogonal to the signal logic.
+            if self.use_day_filter:
+                or_ratio = Indicators.opening_range_ratio(cur_df, prev_df)
+                if or_ratio < self.day_filter_threshold:
+                    exposure = pd.Series(0.0, index=cur_df.index)
+
             # ---- Sizing ----
             if self.use_layer2:
                 # Layer 2: vol-regime factor
@@ -292,12 +311,15 @@ class EnhancedBacktester:
             else:
                 shares = self._sizer.shares(prev_aum, open_price, daily_vol)
 
+            leverage = (shares * open_price) / prev_aum if prev_aum > 0 else 0.0
+
             # ---- P&L ----
             net_pnl, _, trades_count, avg_dur = self._compute_pnl(cur_df["close"], exposure, shares)
             result.loc[current_day, "AUM"]     = prev_aum + net_pnl
             result.loc[current_day, "ret"]     = net_pnl / prev_aum
             result.loc[current_day, "trades"]  = trades_count
             result.loc[current_day, "avg_dur"] = avg_dur
+            result.loc[current_day, "avg_lev"] = leverage if trades_count > 0 else 0.0
             prev_aum = prev_aum + net_pnl
 
             today_dt = pd.Timestamp(current_day)

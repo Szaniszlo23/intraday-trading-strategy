@@ -152,23 +152,28 @@ def plot_train_test(train_res, test_res, best_params: dict, aum_0: float, save_p
 def print_yearly_breakdown(name: str, result) -> None:
     """Print a year-by-year performance table for a BacktestResult."""
     yearly = PerformanceMetrics.compute_yearly(result.returns, result.daily["ret_spy"])
-    trades_by_year = result.daily["trades"].groupby(result.daily.index.year).sum()
+    trades_by_year  = result.daily["trades"].groupby(result.daily.index.year).sum()
     avg_dur_by_year = result.daily["avg_dur"].groupby(result.daily.index.year).mean()
+    # Mean leverage over days where a trade was actually taken (avg_lev > 0)
+    lev_col = result.daily["avg_lev"].replace(0.0, float("nan"))
+    avg_lev_by_year = lev_col.groupby(result.daily.index.year).mean()
 
-    header = f"\n{'─' * 84}\n  {name} — Year-by-Year Breakdown\n{'─' * 84}"
+    header = f"\n{'─' * 100}\n  {name} — Year-by-Year Breakdown\n{'─' * 100}"
     print(header)
-    print(f"  {'Year':<6} {'Ann Ret %':>9} {'Sharpe':>7} {'MaxDD %':>8} {'Hit %':>7} {'N Trades':>9} {'Avg Hold (min)':>14}")
-    print(f"  {'─'*6} {'─'*9} {'─'*7} {'─'*8} {'─'*7} {'─'*9} {'─'*14}")
+    print(f"  {'Year':<6} {'Ann Ret %':>9} {'Sharpe':>7} {'MaxDD %':>8} {'Hit %':>7} {'N Trades':>9} {'Avg Hold (min)':>14} {'Avg Lev':>8}")
+    print(f"  {'─'*6} {'─'*9} {'─'*7} {'─'*8} {'─'*7} {'─'*9} {'─'*14} {'─'*8}")
     for year in sorted(yearly):
-        m = yearly[year]
+        m        = yearly[year]
         n_trades = int(trades_by_year.get(year, 0))
         avg_dur  = avg_dur_by_year.get(year, float("nan"))
+        avg_lev  = avg_lev_by_year.get(year, float("nan"))
         avg_dur_str = f"{avg_dur:>14.1f}" if not np.isnan(avg_dur) else f"{'—':>14}"
+        avg_lev_str = f"{avg_lev:>8.2f}x" if not np.isnan(avg_lev) else f"{'—':>8}"
         print(
             f"  {year:<6} {m.annualized_return:>9.1f} {m.sharpe_ratio:>7.2f} "
-            f"{m.max_drawdown:>8.1f} {m.hit_ratio:>7.1f} {n_trades:>9} {avg_dur_str}"
+            f"{m.max_drawdown:>8.1f} {m.hit_ratio:>7.1f} {n_trades:>9} {avg_dur_str} {avg_lev_str}"
         )
-    print(f"{'─' * 84}")
+    print(f"{'─' * 100}")
 
 
 def run_variants(
@@ -220,16 +225,23 @@ def run_variants(
             signal_gen=EnhancedSignalGenerator(cfg_90, use_dual_bar=True, use_vwap_stop=True),
             use_layer2=True,
         ).run(df_90, dd_90, raw)),
+        ("V7  +Day filter",        lambda: EnhancedBacktester(
+            cfg_90,
+            signal_gen=EnhancedSignalGenerator(cfg_90, use_dual_bar=True, use_vwap_stop=True),
+            use_layer2=True,
+            use_day_filter=True,
+            day_filter_threshold=0.30,
+        ).run(df_90, dd_90, raw)),
     ]
 
-    print("\n" + "═" * 104)
-    print(f"  {'VARIANT ISOLATION ANALYSIS':^102}")
-    print("═" * 104)
+    print("\n" + "═" * 116)
+    print(f"  {'VARIANT ISOLATION ANALYSIS':^114}")
+    print("═" * 116)
     print(
         f"  {'Variant':<22} {'Tot Ret%':>8} {'Ann Ret%':>9} {'Sharpe':>7} "
-        f"{'MaxDD%':>7} {'Hit%':>6} {'Alpha':>7} {'Beta':>6} {'Trades/day':>10} {'Avg Hold(min)':>13}"
+        f"{'MaxDD%':>7} {'Hit%':>6} {'Alpha':>7} {'Beta':>6} {'Trades/day':>10} {'Avg Hold(min)':>13} {'Avg Lev':>8}"
     )
-    print(f"  {'─'*22} {'─'*8} {'─'*9} {'─'*7} {'─'*7} {'─'*6} {'─'*7} {'─'*6} {'─'*10} {'─'*13}")
+    print(f"  {'─'*22} {'─'*8} {'─'*9} {'─'*7} {'─'*7} {'─'*6} {'─'*7} {'─'*6} {'─'*10} {'─'*13} {'─'*8}")
 
     results = {}
     for name, run_fn in variants:
@@ -240,19 +252,23 @@ def run_variants(
         n_days   = len(result.returns.dropna())
         trades_d = result.daily["trades"].sum() / max(n_days, 1)
         avg_hold = result.daily["avg_dur"].mean()
+        # Mean leverage only over days where a trade was actually taken
+        lev_col  = result.daily["avg_lev"].replace(0.0, float("nan"))
+        avg_lev  = lev_col.mean()
         avg_hold_str = f"{avg_hold:>13.1f}" if not np.isnan(avg_hold) else f"{'—':>13}"
+        avg_lev_str  = f"{avg_lev:>7.2f}x"  if not np.isnan(avg_lev)  else f"{'—':>8}"
         print(
             f"  {name:<22} {m.total_return:>8.1f} {m.annualized_return:>9.1f} "
             f"{m.sharpe_ratio:>7.2f} {m.max_drawdown:>7.1f} {m.hit_ratio:>6.1f} "
-            f"{m.alpha:>7.2f} {m.beta:>6.2f} {trades_d:>10.2f} {avg_hold_str}"
+            f"{m.alpha:>7.2f} {m.beta:>6.2f} {trades_d:>10.2f} {avg_hold_str} {avg_lev_str}"
         )
 
-    print("═" * 104)
+    print("═" * 116)
 
     # Plot all 6 equity curves on one chart
     PLOT_DIR.mkdir(parents=True, exist_ok=True)
     fig, ax = plt.subplots(figsize=(14, 7))
-    colours = ["#2C3E50", "#8E44AD", "#2980B9", "#27AE60", "#F39C12", "#E74C3C"]
+    colours = ["#2C3E50", "#8E44AD", "#2980B9", "#27AE60", "#F39C12", "#E74C3C", "#1ABC9C"]
     for (name, _), colour in zip(variants, colours):
         res = results[name]
         ax.plot(res.daily.index, res.aum, label=name.strip(), lw=1.8, color=colour)
@@ -277,6 +293,119 @@ def run_variants(
     save_path = PLOT_DIR / "variant_isolation.png"
     plt.savefig(save_path, dpi=150)
     print(f"\n  Chart saved → {save_path}")
+    plt.show()
+
+    # ---- Return distribution / asymmetry chart ----
+    plot_return_distribution(
+        results,
+        colours,
+        PLOT_DIR / "return_distribution.png",
+    )
+
+
+def plot_return_distribution(results: dict, colours: list[str], save_path: Path) -> None:
+    """
+    Plot the daily-return distribution for each variant.
+
+    Each panel shows:
+      - Green bars  : winning days
+      - Red bars    : losing days
+      - Green dashed: average winning-day return
+      - Red dashed  : average losing-day return
+      - Text box    : Avg Win / Avg Loss / W/L Ratio / Expected Value per day
+
+    A summary asymmetry table is also printed to stdout.
+    """
+    names = list(results.keys())
+    n = len(names)
+    ncols = 4
+    nrows = (n + ncols - 1) // ncols          # ceiling division
+
+    fig, axes = plt.subplots(nrows, ncols, figsize=(ncols * 4.5, nrows * 3.8))
+    axes_flat = axes.flatten() if n > 1 else [axes]
+
+    # ---- Console table header ----
+    print(f"\n{'─' * 90}")
+    print(f"  {'RETURN DISTRIBUTION — ASYMMETRY ANALYSIS':^88}")
+    print(f"{'─' * 90}")
+    print(
+        f"  {'Variant':<22} {'Avg Win%':>8} {'Avg Loss%':>10} {'W/L Ratio':>10} "
+        f"{'EV/day%':>8} {'Skew':>6} {'Kurt':>6}"
+    )
+    print(f"  {'─'*22} {'─'*8} {'─'*10} {'─'*10} {'─'*8} {'─'*6} {'─'*6}")
+
+    for idx, (name, colour) in enumerate(zip(names, colours)):
+        ax = axes_flat[idx]
+        rets = results[name].returns.dropna() * 100   # convert to percent
+
+        wins   = rets[rets > 0]
+        losses = rets[rets < 0]
+
+        avg_win  = wins.mean()   if len(wins)   > 0 else 0.0
+        avg_loss = losses.mean() if len(losses) > 0 else 0.0   # negative number
+        wl_ratio = abs(avg_win / avg_loss) if avg_loss != 0 else float("nan")
+        hit      = len(wins) / len(rets) if len(rets) > 0 else 0.0
+        ev       = hit * avg_win + (1 - hit) * avg_loss        # expected value per day
+        skew     = float(rets.skew())
+        kurt     = float(rets.kurt())
+
+        # Histogram — shared bins across wins and losses for fair comparison
+        all_min, all_max = rets.min(), rets.max()
+        bins = np.linspace(all_min, all_max, 50)
+
+        ax.hist(wins,   bins=bins, color="#27AE60", alpha=0.75, label="Win days",  edgecolor="none")
+        ax.hist(losses, bins=bins, color="#E74C3C", alpha=0.75, label="Loss days", edgecolor="none")
+
+        # Avg lines
+        ax.axvline(avg_win,  color="#1A7A42", lw=1.6, ls="--", label=f"AvgWin {avg_win:+.2f}%")
+        ax.axvline(avg_loss, color="#A93226", lw=1.6, ls="--", label=f"AvgLoss {avg_loss:+.2f}%")
+        ax.axvline(0, color="white", lw=0.8, alpha=0.5)
+
+        # Stats text box
+        stats_txt = (
+            f"W/L ratio : {wl_ratio:.2f}x\n"
+            f"EV/day    : {ev:+.3f}%\n"
+            f"Skew      : {skew:+.2f}"
+        )
+        ax.text(
+            0.97, 0.97, stats_txt,
+            transform=ax.transAxes, fontsize=7.5,
+            verticalalignment="top", horizontalalignment="right",
+            bbox=dict(boxstyle="round,pad=0.3", facecolor="#1A1A2E", alpha=0.85, edgecolor="gray"),
+            color="white", family="monospace",
+        )
+
+        ax.set_title(name.strip(), fontweight="bold", fontsize=9, color="white")
+        ax.set_xlabel("Daily Return (%)", fontsize=8, color="#AAAAAA")
+        ax.set_ylabel("Days", fontsize=8, color="#AAAAAA")
+        ax.tick_params(colors="#AAAAAA", labelsize=7)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        for spine in ax.spines.values():
+            spine.set_edgecolor("#444444")
+        ax.set_facecolor("#0F0F1A")
+        ax.legend(fontsize=6.5, loc="upper left", framealpha=0.5)
+
+        # Console row
+        print(
+            f"  {name:<22} {avg_win:>+8.3f} {avg_loss:>+10.3f} {wl_ratio:>10.2f} "
+            f"{ev:>+8.4f} {skew:>+6.2f} {kurt:>+6.2f}"
+        )
+
+    # Hide unused subplots
+    for idx in range(n, len(axes_flat)):
+        axes_flat[idx].set_visible(False)
+
+    fig.patch.set_facecolor("#0A0A14")
+    fig.suptitle(
+        "Daily Return Distribution — Win/Loss Asymmetry by Variant",
+        fontweight="bold", fontsize=13, color="white", y=1.01,
+    )
+    plt.tight_layout()
+    PLOT_DIR.mkdir(parents=True, exist_ok=True)
+    plt.savefig(save_path, dpi=150, bbox_inches="tight", facecolor=fig.get_facecolor())
+    print(f"{'─' * 90}")
+    print(f"\n  Distribution chart saved → {save_path}")
     plt.show()
 
 
