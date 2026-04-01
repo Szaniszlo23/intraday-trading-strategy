@@ -27,7 +27,7 @@ import logging
 import math
 import signal
 import sys
-from datetime import date, datetime, time, timedelta
+from datetime import datetime, time, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -74,38 +74,37 @@ class LiveTraderV6:
         self.cfg    = app_cfg.strategy
         self.symbol = self.cfg.symbol
 
-        # V6 always uses vol_window=90
+        # Override vol_window to 90 — V6 uses a longer sigma window than the baseline
         self._strat_cfg = StrategyConfig(
             **{**vars(self.cfg), "vol_window": 90}
         )
 
         # Core components
-        self.fetcher     = AlpacaFetcher(app_cfg.alpaca)
-        self.trader      = AlpacaTrader(app_cfg.alpaca)
+        self.fetcher      = AlpacaFetcher(app_cfg.alpaca)
+        self.trader       = AlpacaTrader(app_cfg.alpaca)
         self.preprocessor = Preprocessor(self._strat_cfg)
-        self.signal_gen  = EnhancedSignalGenerator(
+        self.signal_gen   = EnhancedSignalGenerator(
             self._strat_cfg, use_dual_bar=True, use_vwap_stop=True
         )
         self.sizer = EnhancedPositionSizer()
 
         # ── Per-session state ──────────────────────────────────────────────
-        self._today_bars:    list[dict] = []
-        self._last_exposure: float      = 0.0
-        self._prev_close:    float | None = None
+        self._today_bars:    list[dict]   = []    # bars accumulated since 09:30
+        self._last_exposure: float        = 0.0   # last submitted position direction
+        self._prev_close:    float | None = None  # previous day's closing price
 
-        # Layer 2 — computed once at session open
-        self._vol_regime:      float = 1.0
-        self._flow_mult:       float = 1.0
-        self._session_shares:  int   = 0
-        self._session_ready:   bool  = False
+        # Layer 2 values — computed once at 09:30 and held for the full session
+        self._vol_regime:     float = 1.0
+        self._flow_mult:      float = 1.0
+        self._session_shares: int   = 0
+        self._session_ready:  bool  = False
 
         # ── Historical data ────────────────────────────────────────────────
-        self._hist_df:         pd.DataFrame = pd.DataFrame()
-        self._hist_daily:      pd.DataFrame = pd.DataFrame()
-        self._raw_extended:    pd.DataFrame = pd.DataFrame()
+        self._hist_df:      pd.DataFrame = pd.DataFrame()   # session bars (09:30–16:00)
+        self._hist_daily:   pd.DataFrame = pd.DataFrame()   # daily OHLCV + ret
+        self._raw_extended: pd.DataFrame = pd.DataFrame()   # includes pre-market (04:00+)
 
-        # Per-minute sigma lookup for today (recomputed daily)
-        # minute_of_day (int) → sigma_open (float)
+        # minute_of_day → sigma_open float, built from 90-day rolling mean at bootstrap
         self._sigma_lookup: dict[int, float] = {}
         self._dvol_today:   float = float("nan")
 
@@ -510,16 +509,17 @@ class LiveTraderV6:
         self._last_bar_time: datetime = datetime.now(_ET)
 
         # ── Heartbeat loop ────────────────────────────────────────────────
-        # Every 60 seconds check if the WebSocket has gone silent.
-        # If no bar has arrived in 90+ seconds during market hours, fall
-        # back to REST to fetch and process the missing bar(s).
+        # Wakes every 60 s. During market hours, checks how long ago the last
+        # WebSocket bar arrived. If the gap exceeds 90 s, fetches the last 5
+        # minutes via REST and replays any bars we missed. This handles
+        # temporary WebSocket drops without restarting the process.
         while True:
             time.sleep(60)
 
-            now      = datetime.now(_ET)   # always Eastern Time
-            et_time  = now.time()
+            now     = datetime.now(_ET)   # always Eastern Time
+            et_time = now.time()
 
-            # Only check during regular session
+            # Do nothing outside regular session hours
             if not (_SESSION_OPEN <= et_time <= _EOD_CLOSE):
                 continue
 
