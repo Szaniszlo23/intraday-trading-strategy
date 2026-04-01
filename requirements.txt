@@ -1,0 +1,7 @@
+alpaca-py==0.43.2
+pandas==2.2.2
+numpy==1.26.4
+python-dotenv==0.21.0
+PyYAML==6.0.1
+requests==2.32.2
+websockets==16.0

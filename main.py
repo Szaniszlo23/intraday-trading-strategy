@@ -281,13 +281,30 @@ class LiveTraderV6:
         self._flow_mult = Indicators.flow_composite_mult(pm_ret, imbalance)
 
         # --- Position size (fixed for the session) ---
-        equity    = float(self.trader.get_account()["equity"])
+        account   = self.trader.get_account()
+        equity    = float(account["equity"])
+        buying_power = float(account["buying_power"])
         daily_vol = self._dvol_today if not math.isnan(self._dvol_today) else None
 
+        # Pass equity/2 as the sizing base so that max 4× leverage
+        # maps to exactly 2× of total equity — within Alpaca's buying power limit.
+        # The full dynamic range (0.25×–2.0× multiplier) is preserved.
         self._session_shares = self.sizer.shares(
-            equity, open_price, daily_vol,
+            equity / 2, open_price, daily_vol,
             self._vol_regime, self._flow_mult,
         )
+
+        # Safety net: if dynamic sizing still somehow exceeds buying power
+        # (e.g. equity grew, or extreme flow_mult), hard-cap at 95% of buying power.
+        max_shares_by_bp = math.floor(buying_power * 0.95 / open_price)
+        if self._session_shares > max_shares_by_bp:
+            logger.warning(
+                "Capping shares %d → %d to fit buying_power=$%.0f",
+                self._session_shares, max_shares_by_bp, buying_power,
+            )
+            self._session_shares = max_shares_by_bp
+
+        # Leverage relative to total equity (not the halved base)
         leverage = (self._session_shares * open_price) / equity if equity > 0 else 0.0
 
         self._session_ready = True
