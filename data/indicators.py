@@ -208,3 +208,30 @@ class Indicators:
         composite = 0.4 * pm_signal + 0.6 * imbalance
         # Map [-1, 1] → [0.80, 1.20]
         return 0.80 + (composite + 1.0) / 2.0 * 0.40
+
+    @staticmethod
+    def opening_range_ratio(cur_df: pd.DataFrame, prev_df: pd.DataFrame, n_bars: int = 15) -> float:
+        """
+        Ratio of today's opening range (first n_bars minutes) to yesterday's full session range.
+
+        Returns 0.0 if either dataframe is empty or previous range is zero.
+        A high ratio (e.g. > 0.30) suggests a directional/trending day.
+
+        Parameters
+        ----------
+        cur_df  : today's session bars (must have 'high' and 'low' columns)
+        prev_df : previous day's session bars (must have 'high' and 'low' columns)
+        n_bars  : number of opening bars to measure (default 15 = first 15 minutes)
+
+        Returns
+        -------
+        float — opening range / previous day range; 0.0 on missing data.
+        """
+        if cur_df.empty or prev_df.empty:
+            return 0.0
+        opening_bars = cur_df.iloc[:n_bars]
+        or_range = opening_bars["high"].max() - opening_bars["low"].min()
+        prev_range = prev_df["high"].max() - prev_df["low"].min()
+        if prev_range == 0:
+            return 0.0
+        return float(or_range / prev_range)
